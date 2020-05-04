@@ -12,7 +12,9 @@ class DistributedFusedAdamTest(unittest.TestCase):
     def test_single(self):
         model = torch.nn.LSTM(1024, 1024).cuda().half()
         params = list(model.parameters())
-        opt = DistributedFusedAdam(params)
+        world_size, rank = 8, 0 
+        opt = DistributedFusedAdam(params, world_size, rank, learning_rate=1e-2)
+        print(DistributedFusedAdam.__doc__)
         opt.step()
 
 if __name__ == '__main__':
