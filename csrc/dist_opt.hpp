@@ -33,17 +33,19 @@ struct DistributedFusedAdamOptions {
   TORCH_ARG(bool, do_not_flatten_model) = false;
 };
 
-/* Before initializing this, should call these API at Python side:
+/* Before initializing this, should call these API at Python side, and make sure
+ * environment variables WORLD_SIZE, RANK, LOCAL_RANK, MASTER_ADDR, MASTER_PORT
+ * are set correctly:
+ *
+ *   torch.distributed.init_process_group(backend='nccl', init_method="env://")
  *   assert torch.distributed.is_initialized()
  *   world_size = torch.distributed.get_world_size()
  *   rank = torch.distributed.get_rank()
  */
-class DistributedFusedAdam : public torch::optim::Optimizer {
+class DistributedFusedAdam : public torch::optim::Adam {
   public:
     DistributedFusedAdam(
           const std::vector<torch::Tensor> &_params,
-          const int _world_size,
-          const int _rank,
           /** DistributedFusedAdamOptions, leave them here to keep
            *  them shown in Python front-end help.
            */
@@ -77,9 +79,12 @@ class DistributedFusedAdam : public torch::optim::Optimizer {
     void step() override;
 
   private:
-    std::vector<torch::Tensor> params;
+    DistributedFusedAdamOptions options;
+
+    // For NCCL initialization
     const int world_size;
     const int rank;
-    DistributedFusedAdamOptions options;
+    const std::string master_addr;
+    const int master_port;
 };
 

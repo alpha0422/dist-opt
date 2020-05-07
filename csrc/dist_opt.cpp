@@ -1,4 +1,10 @@
 #include "dist_opt.hpp"
+#include "../c10d/ProcessGroupNCCL.hpp"
+#include "../c10d/TCPStore.hpp"
+#include "../c10d/PrefixStore.hpp"
+
+using namespace c10d;
+
 #include <pybind11/pybind11.h>
 
 namespace py = pybind11;
@@ -6,8 +12,6 @@ using namespace pybind11::literals;
 
 DistributedFusedAdam::DistributedFusedAdam(
       const std::vector<torch::Tensor> &_params,
-      const int _world_size,
-      const int _rank,
       /** DistributedFusedAdamOptions, leave them here to keep
        *  them shown in Python front-end help.
        */
@@ -37,7 +41,15 @@ DistributedFusedAdam::DistributedFusedAdam(
       bool _predivide = true,
       bool _e5m2_allgather = false,
       bool _do_not_flatten_model = false)
-    : params(_params), world_size(_world_size), rank(_rank)  {
+    : torch::optim::Adam(_params,
+        torch::optim::AdamOptions(_learning_rate)
+          .beta1(_beta1).beta2(_beta2).weight_decay(_weight_decay)
+          .eps(_eps).amsgrad(_amsgrad)),
+      world_size(atoi(getenv("WORLD_SIZE"))),
+      rank(atoi(getenv("RANK"))),
+      master_addr(getenv("MASTER_ADDR")),
+      master_port(atoi(getenv("MASTER_PORT"))) {
+
   options.learning_rate(_learning_rate)
          .bias_correction(_bias_correction)
          .beta1(_beta1)
@@ -64,6 +76,18 @@ DistributedFusedAdam::DistributedFusedAdam(
          .predivide(_predivide)
          .e5m2_allgather(_e5m2_allgather)
          .do_not_flatten_model(_do_not_flatten_model);
+
+  // Now start the TCP store daemon on the rank 0
+  auto store = std::make_shared<TCPStore>(master_addr, master_port, world_size);
+  auto prefix_store = std::make_shared<PrefixStore>("rs1", store);
+  ProcessGroupNCCL pg(prefix_store, rank, world_size);
+
+  auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA);
+  at::Tensor tensor = at::empty({8, 8}, options);
+  std::vector<at::Tensor> tensors;
+  tensors.push_back(tensor);
+  std::shared_ptr<ProcessGroup::Work> work = pg.allreduce(tensors);
+  work->wait();
 }
 
 void DistributedFusedAdam::step() {
@@ -73,13 +97,11 @@ void DistributedFusedAdam::step() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<DistributedFusedAdam>(m, "DistributedFusedAdam")
     .def(py::init<const std::vector<torch::Tensor> ,
-      const int, const int, double, bool, double, double,
+      double, bool, double, double,
       double, bool, double, double, bool, bool, double, bool,
       bool, bool, long, long, long, long, long, long, long,
       long, bool, bool, bool, bool>(),
       "params"_a,
-      "world_size"_a,
-      "rank"_a,
       "learning_rate"_a=1e-3,
       "bias_correction"_a=true,
       "beta1"_a=0.9,
