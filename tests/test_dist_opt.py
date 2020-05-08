@@ -28,7 +28,6 @@ def find_free_port():
     return sockname[1]
 
 def _multi_process_setup(world_size, rank, port):
-    print(world_size, rank, port)
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(port)
     os.environ['WORLD_SIZE'] = str(world_size)
@@ -45,7 +44,7 @@ def _test_mp_dist_opt_simple(rank, world_size, port):
 
     model = torch.nn.LSTM(1024, 1024).cuda().half()
     params = list(model.parameters())
-    opt = DistributedFusedAdam(params, learning_rate=1e-2)
+    opt = DistributedFusedAdam(params, lr=1e-2)
     opt.step()
 
 class DistributedFusedAdamMultiProcessTest(unittest.TestCase):

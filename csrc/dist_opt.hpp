@@ -3,17 +3,13 @@
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 
-struct DistributedFusedAdamOptions {
-  DistributedFusedAdamOptions() {}
-  TORCH_ARG(double, learning_rate) = 1e-3;
+#include <limits>
+
+
+struct DistributedOptimizerOptions {
   TORCH_ARG(bool, bias_correction) = true;
-  TORCH_ARG(double, beta1) = 0.9;
-  TORCH_ARG(double, beta2) = 0.999;
-  TORCH_ARG(double, eps) = 1e-8;
-  TORCH_ARG(bool, eps_inside_sqrt) = false;
-  TORCH_ARG(double, weight_decay) = 0;
+  TORCH_ARG(int, eps_mode) = 1; // eps_inside_sqrt = False
   TORCH_ARG(double, max_grad_norm) = 0;
-  TORCH_ARG(bool, amsgrad) = false;
   TORCH_ARG(bool, use_mt) = false;
   TORCH_ARG(double, amp_scale_adjustment) = 1;
   TORCH_ARG(bool, overlap_reductions) = true;
@@ -41,23 +37,26 @@ struct DistributedFusedAdamOptions {
  *   assert torch.distributed.is_initialized()
  *   world_size = torch.distributed.get_world_size()
  *   rank = torch.distributed.get_rank()
+ *   torch.cuda.set_device(rank)
  */
 class DistributedFusedAdam : public torch::optim::Adam {
   public:
     DistributedFusedAdam(
+          /** Since we only assume single param group for now,
+           *  let's not use OptimizerParamGroup.
+           */
           const std::vector<torch::Tensor> &_params,
           /** DistributedFusedAdamOptions, leave them here to keep
            *  them shown in Python front-end help.
            */
-          double _learning_rate,
-          bool _bias_correction,
-          double _beta1,
-          double _beta2,
+          double _lr,
+          std::tuple<double, double> _betas,
           double _eps,
-          bool _eps_inside_sqrt,
           double _weight_decay,
-          double _max_grad_norm,
           bool _amsgrad,
+          bool _bias_correction,
+          bool _eps_inside_sqrt,
+          double _max_grad_norm,
           bool _use_mt,
           double _amp_scale_adjustment,
           bool _overlap_reductions,
@@ -76,15 +75,33 @@ class DistributedFusedAdam : public torch::optim::Adam {
           bool _e5m2_allgather,
           bool _do_not_flatten_model);
     ~DistributedFusedAdam() {}
-    void step() override;
+    torch::Tensor step(LossClosure closure) override;
 
   private:
-    DistributedFusedAdamOptions options;
+    DistributedOptimizerOptions options;
 
     // For NCCL initialization
     const int world_size;
     const int rank;
     const std::string master_addr;
     const int master_port;
+    const int group_size;
+    const int num_groups;
+    const int rank_in_group;
+
+    // Distributed optimizer specifics
+    bool _last_step = false;
+    // Must set global scale first
+    double _global_scale = std::numeric_limits<double>::quiet_NaN();
+
+    at::Tensor _overflow_buf = at::zeros({1}, at::TensorOptions().dtype(at::kLong)
+        .device(at::kCUDA));
+    at::Tensor _L2_grad_norm = at::zeros({1}, at::TensorOptions().dtype(at::kFloat)
+        .device(at::kCUDA));
+
+    // Pair of (param_grads_size, param_offset)
+    std::vector<std::pair<int64_t, int64_t> > grads_info;
+    std::vector<at::Tensor> grad_acc;
+    std::vector<at::Tensor> model_params;
 };
 
