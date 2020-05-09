@@ -111,6 +111,9 @@ class DistributedFusedAdam : public torch::optim::Adam {
     const int num_groups;
     const int rank_in_group;
 
+    // Logging to stdout controlled by env DIST_OPT_LOGG
+    const bool logging = false;
+
     // Distributed optimizer specifics
     bool _last_step = false;
     // Must set global scale first

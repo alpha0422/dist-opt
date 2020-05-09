@@ -11,6 +11,13 @@ using namespace c10d;
 namespace py = pybind11;
 using namespace pybind11::literals;
 
+#define LOGGING(fmt, ...) do { \
+  if (logging) { \
+    std::printf("[%d:%d] " fmt, world_size, rank, ##__VA_ARGS__); \
+    std::cout.flush(); \
+  } \
+} while(0)
+
 #ifndef DIST_OPT_HOOK_TENSOR
 // Function hook executed after AccumulateGrad
 class AccGradPostHook : public torch::autograd::FunctionPostHook {
@@ -92,7 +99,8 @@ DistributedFusedAdam::DistributedFusedAdam(
       num_groups(atoi(getenv("WORLD_SIZE")) / (_dwu_group_size <= 0 ?
         torch::cuda::device_count() : _dwu_group_size)),
       rank_in_group(atoi(getenv("RANK")) / (_dwu_group_size <= 0 ?
-        torch::cuda::device_count() : _dwu_group_size)) {
+        torch::cuda::device_count() : _dwu_group_size)),
+      logging(getenv("DIST_OPT_LOG") ? true : false) {
 
   options.bias_correction(_bias_correction)
          .eps_mode(_eps_inside_sqrt ? 0 : 1)
@@ -155,8 +163,7 @@ DistributedFusedAdam::DistributedFusedAdam(
         state_[c10::guts::to_string(p.unsafeGetTensorImpl())] = std::move(state);
       }
 
-      std::printf("[%d:%d] hook %ld start at %ld size %ld\n", world_size, rank,
-          p_i, p_offset, p_grads_size);
+      LOGGING("hook %ld start at %ld size %ld\n", p_i, p_offset, p_grads_size);
 
 #ifdef DIST_OPT_HOOK_TENSOR
       // Hook on tensor
@@ -193,7 +200,7 @@ DistributedFusedAdam::DistributedFusedAdam(
   std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
   work->wait();
 
-  std::printf("[%d:%d] DistributedFusedAdam init done.\n", world_size, rank);
+  LOGGING("DistributedFusedAdam init done.\n");
 }
 
 void DistributedFusedAdam::do_overlapped_reduction(long param_i,
@@ -202,8 +209,8 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
       *state_[c10::guts::to_string(
       model_params[0].unsafeGetTensorImpl())]);
   if (param_state.step() == 0)
-    std::printf("[%d:%d] invoke hook %ld start at %ld size %ld\n", world_size, rank,
-        param_i, param_offset, param_grads_size);
+    LOGGING("invoke hook %ld start at %ld size %ld\n", param_i,
+        param_offset, param_grads_size);
 }
 
 torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr) {
