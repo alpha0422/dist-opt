@@ -11,6 +11,43 @@ using namespace c10d;
 namespace py = pybind11;
 using namespace pybind11::literals;
 
+#ifndef DIST_OPT_HOOK_TENSOR
+// Function hook executed after AccumulateGrad
+class AccGradPostHook : public torch::autograd::FunctionPostHook {
+  using variable_list = std::vector<torch::autograd::Variable>;
+
+ public:
+  /* implicit */ AccGradPostHook(DistributedFusedAdam* _dfa, long _p_i,
+    long _p_grads_size, long _p_offset, at::Tensor& _param)
+      : dfa(_dfa), p_i(_p_i), p_grads_size(_p_grads_size),
+        p_offset(_p_offset), param(_param)  {}
+
+  variable_list operator()(
+      const variable_list& outputs,
+      const variable_list& /* unused */) override {
+    dfa->do_overlapped_reduction(p_i, p_grads_size, p_offset, param);
+    return outputs;
+  }
+
+ protected:
+  DistributedFusedAdam* dfa;
+  const long p_i;
+  const long p_grads_size;
+  const long p_offset;
+  at::Tensor& param;
+};
+#endif
+
+void DistributedFusedAdamParamState::serialize(
+    torch::serialize::OutputArchive& archive) const {
+  _TORCH_OPTIM_SERIALIZE_TORCH_ARG(step);
+}
+
+void DistributedFusedAdamParamState::serialize(
+    torch::serialize::InputArchive& archive) {
+  _TORCH_OPTIM_DESERIALIZE_TORCH_ARG(int64_t, step);
+}
+
 DistributedFusedAdam::DistributedFusedAdam(
       const std::vector<torch::Tensor> &_params,
       /** DistributedFusedAdamOptions, leave them here to keep
@@ -96,6 +133,58 @@ DistributedFusedAdam::DistributedFusedAdam(
   auto prefix_store = std::make_shared<PrefixStore>("dpg", store);
   ProcessGroupNCCL default_pg(prefix_store, rank, world_size);
 
+  // Register backward hook
+  long p_offset = 0, p_i = 0;
+  for (auto& group : param_groups()) {
+    at::Tensor *prev = nullptr;
+    for (auto& p : group.params()) {
+      size_t p_grads_size = p.numel();
+
+      // Broadcast parameter of rank 0
+      std::vector<at::Tensor> tensors = {p};
+      std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
+      work->wait();
+
+      if (!p.requires_grad())  continue;
+
+      model_params.push_back(p);
+      auto param_state = state_.find(c10::guts::to_string(p.unsafeGetTensorImpl()));
+      if(param_state == state_.end()) {
+        auto state = std::make_unique<DistributedFusedAdamParamState>();
+        state->step(0);
+        state_[c10::guts::to_string(p.unsafeGetTensorImpl())] = std::move(state);
+      }
+
+      std::printf("[%d:%d] hook %ld start at %ld size %ld\n", world_size, rank,
+          p_i, p_offset, p_grads_size);
+
+#ifdef DIST_OPT_HOOK_TENSOR
+      // Hook on tensor
+      auto hook = [&, p_i, p_grads_size, p_offset](at::Tensor grad) {
+        do_overlapped_reduction(p_i, p_grads_size, p_offset, p);
+      };
+      p.register_hook(hook);
+#else 
+      // Hook on gradient accumulation function
+      auto p_tmp = p.expand_as(p);
+      assert(("Expect valid grad_fn.", !p_tmp.grad_fn()));
+      auto grad_acc = p_tmp.grad_fn()->next_edge(0).function;
+      auto allreduce_hook = AccGradPostHook(this, p_i, p_grads_size, p_offset, p);
+      grad_acc->add_post_hook(torch::make_unique<AccGradPostHook>(allreduce_hook));
+      grad_accs.push_back(std::move(grad_acc));
+#endif
+
+      p_offset += p_grads_size;
+      if (prev && (reinterpret_cast<uint8_t*>(prev->data_ptr()) +
+          prev->numel() * prev->element_size() ==
+          reinterpret_cast<uint8_t*>(p.data_ptr()))) {
+        p_offset = ((p_offset + 63) / 64) * 64;
+      }
+      prev = &p;
+      p_i++;
+    }
+  }
+
   // Now start the TCP store daemon on the rank 0
   auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA);
   at::Tensor tensor = at::empty({8, 8}, options);
@@ -103,6 +192,18 @@ DistributedFusedAdam::DistributedFusedAdam(
   tensors.push_back(tensor);
   std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
   work->wait();
+
+  std::printf("[%d:%d] DistributedFusedAdam init done.\n", world_size, rank);
+}
+
+void DistributedFusedAdam::do_overlapped_reduction(long param_i,
+    long param_grads_size, long param_offset, at::Tensor &param) {
+  auto& param_state = static_cast<DistributedFusedAdamParamState&>(
+      *state_[c10::guts::to_string(
+      model_params[0].unsafeGetTensorImpl())]);
+  if (param_state.step() == 0)
+    std::printf("[%d:%d] invoke hook %ld start at %ld size %ld\n", world_size, rank,
+        param_i, param_offset, param_grads_size);
 }
 
 torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr) {

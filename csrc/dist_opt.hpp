@@ -5,6 +5,8 @@
 
 #include <limits>
 
+// Hook on AccumulateGrad by default
+#undef DIST_OPT_HOOK_TENSOR
 
 struct DistributedOptimizerOptions {
   TORCH_ARG(bool, bias_correction) = true;
@@ -28,6 +30,19 @@ struct DistributedOptimizerOptions {
   TORCH_ARG(bool, e5m2_allgather) = false;
   TORCH_ARG(bool, do_not_flatten_model) = false;
 };
+
+/** We only need step for now. */
+struct DistributedFusedAdamParamState : public 
+    torch::optim::OptimizerCloneableParamState<DistributedFusedAdamParamState> {
+  TORCH_ARG(int64_t, step) = 0;
+
+public:
+  void serialize(torch::serialize::InputArchive& archive) override;
+  void serialize(torch::serialize::OutputArchive& archive) const override;
+  ~DistributedFusedAdamParamState() = default;
+};
+
+class AccGradPostHook;
 
 /* Before initializing this, should call these API at Python side, and make sure
  * environment variables WORLD_SIZE, RANK, LOCAL_RANK, MASTER_ADDR, MASTER_PORT
@@ -77,6 +92,13 @@ class DistributedFusedAdam : public torch::optim::Adam {
     ~DistributedFusedAdam() {}
     torch::Tensor step(LossClosure closure) override;
 
+  protected:
+#ifndef DIST_OPT_HOOK_TENSOR
+    friend class AccGradPostHook;
+#endif
+    void do_overlapped_reduction(long param_i, long param_grads_size,
+        long param_offset, at::Tensor &param);
+
   private:
     DistributedOptimizerOptions options;
 
@@ -93,6 +115,7 @@ class DistributedFusedAdam : public torch::optim::Adam {
     bool _last_step = false;
     // Must set global scale first
     double _global_scale = std::numeric_limits<double>::quiet_NaN();
+    bool _has_overflow = false;
 
     at::Tensor _overflow_buf = at::zeros({1}, at::TensorOptions().dtype(at::kLong)
         .device(at::kCUDA));
@@ -101,7 +124,9 @@ class DistributedFusedAdam : public torch::optim::Adam {
 
     // Pair of (param_grads_size, param_offset)
     std::vector<std::pair<int64_t, int64_t> > grads_info;
-    std::vector<at::Tensor> grad_acc;
     std::vector<at::Tensor> model_params;
+#ifndef DIST_OPT_HOOK_TENSOR
+    std::vector<std::shared_ptr<torch::autograd::Node> > grad_accs;
+#endif
 };
 

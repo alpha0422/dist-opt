@@ -45,6 +45,12 @@ def _test_mp_dist_opt_simple(rank, world_size, port):
     model = torch.nn.LSTM(1024, 1024).cuda().half()
     params = list(model.parameters())
     opt = DistributedFusedAdam(params, lr=1e-2)
+
+    x0 = torch.zeros((38, 16, 1024), device='cuda', dtype=torch.half)
+    y0, _ = model(x0)
+    dy = torch.zeros_like(y0)
+    y0.backward(dy)
+
     opt.step()
 
 class DistributedFusedAdamMultiProcessTest(unittest.TestCase):
