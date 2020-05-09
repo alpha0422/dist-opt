@@ -12,8 +12,20 @@ namespace py = pybind11;
 using namespace pybind11::literals;
 
 #define LOGGING(fmt, ...) do { \
-  if (logging) { \
-    std::printf("[%d:%d] " fmt, world_size, rank, ##__VA_ARGS__); \
+  if (options.logging()) { \
+    std::printf("[%d:%d] " fmt, options.world_size(), options.rank(), \
+      ##__VA_ARGS__); \
+    std::cout.flush(); \
+  } \
+} while(0)
+
+#define LOGGING_VEC(prefix, fmt, vec) do { \
+  if (options.logging()) { \
+    std::printf("[%d:%d] " prefix, options.world_size(), options.rank()); \
+    for (auto i : vec) { \
+      std::printf(" " fmt, i); \
+    } \
+    std::printf("\n"); \
     std::cout.flush(); \
   } \
 } while(0)
@@ -90,15 +102,7 @@ DistributedFusedAdam::DistributedFusedAdam(
         torch::optim::AdamOptions(_lr)
           .betas(_betas).weight_decay(_weight_decay)
           .eps(_eps).amsgrad(_amsgrad)),
-      world_size(atoi(getenv("WORLD_SIZE"))),
-      rank(atoi(getenv("RANK"))),
-      master_addr(getenv("MASTER_ADDR")),
-      master_port(atoi(getenv("MASTER_PORT"))),
-      group_size(_dwu_group_size <= 0 ? torch::cuda::device_count() :
-        _dwu_group_size),
-      num_groups(world_size / group_size),
-      rank_in_group(rank % group_size),
-      logging(getenv("DIST_OPT_LOG") ? true : false) {
+      current_block(_overlap_reductions ? _dwu_num_blocks : -1) {
 
   options.bias_correction(_bias_correction)
          .eps_mode(_eps_inside_sqrt ? 0 : 1)
@@ -109,17 +113,27 @@ DistributedFusedAdam::DistributedFusedAdam(
          .full_pipeline(_full_pipeline)
          .compute_L2_grad_norm(_compute_L2_grad_norm)
          .distributed_weight_update(_distributed_weight_update)
-         .dwu_group_size(_dwu_group_size)
-         .dwu_num_blocks(_dwu_num_blocks)
-         .dwu_num_rs_pg(_dwu_num_rs_pg)
-         .dwu_num_ar_pg(_dwu_num_ar_pg)
-         .dwu_num_ag_pg(_dwu_num_ag_pg)
-         .dwu_num_chunks(_dwu_num_chunks)
+         .num_blocks(_dwu_num_blocks)
+         .num_rs_pg(_dwu_num_rs_pg)
+         .num_ar_pg(_dwu_num_ar_pg)
+         .num_ag_pg(_dwu_num_ag_pg)
+         .num_chunks(_dwu_num_chunks)
          .revert_method(_revert_method)
          .flat_mt(_flat_mt)
          .predivide(_predivide)
          .e5m2_allgather(_e5m2_allgather)
          .do_not_flatten_model(_do_not_flatten_model);
+
+  options.logging(getenv("DIST_OPT_LOG") ? true : false)
+         .world_size(atoi(getenv("WORLD_SIZE")))
+         .rank(atoi(getenv("RANK")))
+         .master_addr(getenv("MASTER_ADDR"))
+         .master_port(atoi(getenv("MASTER_PORT")));
+
+  options.group_size(_dwu_group_size <= 0 ? torch::cuda::device_count() :
+            _dwu_group_size)
+         .num_groups(options.world_size() / options.group_size())
+         .rank_in_group(options.rank() % options.group_size());
 
   // Parameter check
   assert(("DistributedFusedAdam does not support use_mt.", !options.use_mt()));
@@ -133,23 +147,22 @@ DistributedFusedAdam::DistributedFusedAdam(
         "will consume more memory" << std::endl;
   }
 
-  LOGGING("master: %s:%d\n", master_addr.c_str(), master_port);
-  LOGGING("group_size %d num_groups %d rank_in_group %d\n", group_size,
-    num_groups, rank_in_group);
+  LOGGING("master: %s:%d\n", options.master_addr().c_str(), options.master_port());
+  LOGGING("group_size %ld num_groups %ld rank_in_group %ld\n",
+    options.group_size(), options.num_groups(), options.rank_in_group());
 
   // We don't have access to default process group here, build a new one
   // for parameter broadcast.
-  auto store = std::make_shared<TCPStore>(master_addr, master_port, world_size);
+  auto store = std::make_shared<TCPStore>(options.master_addr(),
+    options.master_port(), options.world_size());
   auto prefix_store = std::make_shared<PrefixStore>("dpg", store);
-  ProcessGroupNCCL default_pg(prefix_store, rank, world_size);
+  ProcessGroupNCCL default_pg(prefix_store, options.rank(), options.world_size());
 
   // Register backward hook
   long p_offset = 0, p_i = 0;
   for (auto& group : param_groups()) {
     at::Tensor *prev = nullptr;
     for (auto& p : group.params()) {
-      size_t p_grads_size = p.numel();
-
       // Broadcast parameter of rank 0
       std::vector<at::Tensor> tensors = {p};
       std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
@@ -157,6 +170,7 @@ DistributedFusedAdam::DistributedFusedAdam(
 
       if (!p.requires_grad())  continue;
 
+      size_t p_grads_size = p.numel();
       model_params.push_back(p);
       auto param_state = state_.find(c10::guts::to_string(p.unsafeGetTensorImpl()));
       if(param_state == state_.end()) {
@@ -165,7 +179,7 @@ DistributedFusedAdam::DistributedFusedAdam(
         state_[c10::guts::to_string(p.unsafeGetTensorImpl())] = std::move(state);
       }
 
-      LOGGING("hook %ld start at %ld size %ld\n", p_i, p_offset, p_grads_size);
+      LOGGING("hook param %ld start at %ld size %ld\n", p_i, p_offset, p_grads_size);
 
 #ifdef DIST_OPT_HOOK_TENSOR
       // Hook on tensor
@@ -183,9 +197,15 @@ DistributedFusedAdam::DistributedFusedAdam(
       grad_accs.push_back(std::move(grad_acc));
 #endif
 
+      grads_info.push_back(std::make_pair(p_grads_size, p_offset));
       p_offset += p_grads_size;
+
+      /** Only enforce 128b alignment (64 * fp16) for non-consecutive parameters
+       *  RNN is one example of consecutive parameters:
+       *  (weight_ih, weight_hh, bias_ih, bias_hh)
+       */
       if (prev && (reinterpret_cast<uint8_t*>(prev->data_ptr()) +
-          prev->numel() * prev->element_size() ==
+          prev->numel() * prev->element_size() !=
           reinterpret_cast<uint8_t*>(p.data_ptr()))) {
         p_offset = ((p_offset + 63) / 64) * 64;
       }
@@ -193,10 +213,40 @@ DistributedFusedAdam::DistributedFusedAdam(
       p_i++;
     }
   }
+  grads_generated.resize(p_i, false);
+
+  // Arguments for distributed optimizer
+  options.net_total_param_size(p_offset);
+  long total_param_size = p_offset;
+  const long dwu_min_page_size = 256 * options.num_blocks() *
+    options.num_chunks() * options.group_size();
+  total_param_size = (total_param_size + dwu_min_page_size - 1) /
+    dwu_min_page_size * dwu_min_page_size;
+  options.block_size(total_param_size / options.num_blocks());
+  options.chunk_size(options.block_size() / options.num_chunks());
+  options.shard_size(options.chunk_size() / options.group_size());
+
+  LOGGING("Sizes: net_total_param=%ld, total_param=%ld, min_page=%ld, "
+          "block=%ld, chunk=%ld, shard=%ld\n", options.net_total_param_size(),
+          total_param_size, dwu_min_page_size, options.block_size(),
+          options.chunk_size(), options.shard_size());
+
+  // FIXME: you'll get "low_param_i: 0 0 1 1" for a single LSTM layer
+  low_param_i.resize(options.num_blocks(), 0);
+  for (int block_id = options.num_blocks()-1; block_id >= 0; block_id--) {
+    int p_idx = p_i - 1;
+    while (p_idx > 0 && grads_info[p_idx].second > block_id *
+        options.block_size()) {
+      p_idx--;
+    }
+    low_param_i[block_id] = p_idx;
+  }
+  LOGGING_VEC("low_param_i:", "%ld", low_param_i);
+
 
   // Now start the TCP store daemon on the rank 0
-  auto options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA);
-  at::Tensor tensor = at::empty({8, 8}, options);
+  auto tensor_options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA);
+  at::Tensor tensor = at::empty({8, 8}, tensor_options);
   std::vector<at::Tensor> tensors;
   tensors.push_back(tensor);
   std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
@@ -211,7 +261,7 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
       *state_[c10::guts::to_string(
       model_params[0].unsafeGetTensorImpl())]);
   if (param_state.step() == 0)
-    LOGGING("invoke hook %ld start at %ld size %ld\n", param_i,
+    LOGGING("invoke hook param %ld start at %ld size %ld\n", param_i,
         param_offset, param_grads_size);
 }
 

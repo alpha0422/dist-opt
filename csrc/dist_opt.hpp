@@ -8,9 +8,12 @@
 // Hook on AccumulateGrad by default
 #undef DIST_OPT_HOOK_TENSOR
 
+// Store various *constant* options passed or calculated during initialization
 struct DistributedOptimizerOptions {
+  // Passed during initialization
   TORCH_ARG(bool, bias_correction) = true;
   TORCH_ARG(int, eps_mode) = 1; // eps_inside_sqrt = False
+  // TODO: keep max_grad_norm not per parameter group for now
   TORCH_ARG(double, max_grad_norm) = 0;
   TORCH_ARG(bool, use_mt) = false;
   TORCH_ARG(double, amp_scale_adjustment) = 1;
@@ -18,17 +21,32 @@ struct DistributedOptimizerOptions {
   TORCH_ARG(bool, full_pipeline) = true;
   TORCH_ARG(bool, compute_L2_grad_norm) = false;
   TORCH_ARG(long, distributed_weight_update) = 0;
-  TORCH_ARG(long, dwu_group_size) = 0;
-  TORCH_ARG(long, dwu_num_blocks) = 4;
-  TORCH_ARG(long, dwu_num_rs_pg) = 1;
-  TORCH_ARG(long, dwu_num_ar_pg) = 4;
-  TORCH_ARG(long, dwu_num_ag_pg) = 0;
-  TORCH_ARG(long, dwu_num_chunks) = 4;
+  TORCH_ARG(long, num_blocks) = 4;
+  TORCH_ARG(long, num_rs_pg) = 1;
+  TORCH_ARG(long, num_ar_pg) = 4;
+  TORCH_ARG(long, num_ag_pg) = 0;
+  TORCH_ARG(long, num_chunks) = 4;
   TORCH_ARG(long, revert_method) = 1;
   TORCH_ARG(bool, flat_mt) = false;
   TORCH_ARG(bool, predivide) = true;
   TORCH_ARG(bool, e5m2_allgather) = false;
   TORCH_ARG(bool, do_not_flatten_model) = false;
+
+  // Logging to stdout controlled by env DIST_OPT_LOGG
+  TORCH_ARG(bool, logging) = false;
+
+  // Calculated
+  TORCH_ARG(int, world_size);
+  TORCH_ARG(int, rank);
+  TORCH_ARG(std::string, master_addr);
+  TORCH_ARG(int, master_port);
+  TORCH_ARG(long, group_size) = 0;
+  TORCH_ARG(long, num_groups);
+  TORCH_ARG(long, rank_in_group);
+  TORCH_ARG(long, net_total_param_size);
+  TORCH_ARG(long, block_size);
+  TORCH_ARG(long, chunk_size);
+  TORCH_ARG(long, shard_size);
 };
 
 /** We only need step for now. */
@@ -102,19 +120,8 @@ class DistributedFusedAdam : public torch::optim::Adam {
   private:
     DistributedOptimizerOptions options;
 
-    // For NCCL initialization
-    const int world_size;
-    const int rank;
-    const std::string master_addr;
-    const int master_port;
-    const int group_size;
-    const int num_groups;
-    const int rank_in_group;
-
-    // Logging to stdout controlled by env DIST_OPT_LOGG
-    const bool logging = false;
-
     // Distributed optimizer specifics
+    int current_block;
     bool _last_step = false;
     // Must set global scale first
     double _global_scale = std::numeric_limits<double>::quiet_NaN();
@@ -131,5 +138,9 @@ class DistributedFusedAdam : public torch::optim::Adam {
 #ifndef DIST_OPT_HOOK_TENSOR
     std::vector<std::shared_ptr<torch::autograd::Node> > grad_accs;
 #endif
+    std::vector<at::Tensor*> grads;
+    std::vector<bool> grads_generated;
+    // Param index that will invoke gradient reductions
+    std::vector<long> low_param_i;
 };
 
