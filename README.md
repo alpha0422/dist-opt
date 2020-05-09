@@ -1,6 +1,12 @@
 # dist-opt
 PyTorch distributed optimizer C++ implementation.
 
+## Test
+
+```console
+$ DIST_OPT_LOG=1 pytest -s -k test_mp_dist_opt_simple
+```
+
 ## Dependency
 
 1. [cameron314/readerwriterqueue](https://github.com/cameron314/readerwriterqueue.git)

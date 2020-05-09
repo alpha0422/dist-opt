@@ -96,10 +96,8 @@ DistributedFusedAdam::DistributedFusedAdam(
       master_port(atoi(getenv("MASTER_PORT"))),
       group_size(_dwu_group_size <= 0 ? torch::cuda::device_count() :
         _dwu_group_size),
-      num_groups(atoi(getenv("WORLD_SIZE")) / (_dwu_group_size <= 0 ?
-        torch::cuda::device_count() : _dwu_group_size)),
-      rank_in_group(atoi(getenv("RANK")) / (_dwu_group_size <= 0 ?
-        torch::cuda::device_count() : _dwu_group_size)),
+      num_groups(world_size / group_size),
+      rank_in_group(rank % group_size),
       logging(getenv("DIST_OPT_LOG") ? true : false) {
 
   options.bias_correction(_bias_correction)
@@ -134,6 +132,10 @@ DistributedFusedAdam::DistributedFusedAdam(
     std::cout << "revert_method -> double buffer fp32 parameters, "
         "will consume more memory" << std::endl;
   }
+
+  LOGGING("master: %s:%d\n", master_addr.c_str(), master_port);
+  LOGGING("group_size %d num_groups %d rank_in_group %d\n", group_size,
+    num_groups, rank_in_group);
 
   // We don't have access to default process group here, build a new one
   // for parameter broadcast.
