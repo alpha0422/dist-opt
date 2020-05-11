@@ -1,15 +1,15 @@
 #include "dist_opt.hpp"
-#include "../c10d/ProcessGroupNCCL.hpp"
-#include "../c10d/TCPStore.hpp"
-#include "../c10d/PrefixStore.hpp"
 
-using namespace c10d;
+using torch::indexing::Slice;
 
 #include <pybind11/pybind11.h>
 #include <pybind11/functional.h>
 
 namespace py = pybind11;
 using namespace pybind11::literals;
+
+#define PG_NAME_LEN 128
+#define NCCL_TIME_OUT (120 * 1000)
 
 #define LOGGING(fmt, ...) do { \
   if (options.logging()) { \
@@ -102,7 +102,9 @@ DistributedFusedAdam::DistributedFusedAdam(
         torch::optim::AdamOptions(_lr)
           .betas(_betas).weight_decay(_weight_decay)
           .eps(_eps).amsgrad(_amsgrad)),
-      current_block(_overlap_reductions ? _dwu_num_blocks : -1) {
+      current_block(_overlap_reductions ? _dwu_num_blocks : -1),
+      l2_grad_norm_st(at::cuda::getStreamFromPool()),
+      completion_st(at::cuda::getStreamFromPool()) {
 
   options.bias_correction(_bias_correction)
          .eps_mode(_eps_inside_sqrt ? 0 : 1)
@@ -133,6 +135,7 @@ DistributedFusedAdam::DistributedFusedAdam(
   options.group_size(_dwu_group_size <= 0 ? torch::cuda::device_count() :
             _dwu_group_size)
          .num_groups(options.world_size() / options.group_size())
+         .group_rank(options.rank() / options.group_size())
          .rank_in_group(options.rank() % options.group_size());
 
   // Parameter check
@@ -155,8 +158,10 @@ DistributedFusedAdam::DistributedFusedAdam(
   // for parameter broadcast.
   auto store = std::make_shared<TCPStore>(options.master_addr(),
     options.master_port(), options.world_size());
-  auto prefix_store = std::make_shared<PrefixStore>("dpg", store);
-  ProcessGroupNCCL default_pg(prefix_store, options.rank(), options.world_size());
+  auto dpg_prefix_store = std::make_shared<PrefixStore>("dpg", store);
+  auto timeout = std::chrono::milliseconds(NCCL_TIME_OUT);
+  ProcessGroupNCCL default_pg(dpg_prefix_store, options.rank(),
+    options.world_size(), timeout);
 
   // Register backward hook
   long p_offset = 0, p_i = 0;
@@ -243,14 +248,248 @@ DistributedFusedAdam::DistributedFusedAdam(
   }
   LOGGING_VEC("low_param_i:", "%ld", low_param_i);
 
+  // Flattened parameters, gradients, states
+  const long mega_shard_size = options.num_blocks() * options.num_chunks() *
+    options.shard_size();
+  auto base_options = at::TensorOptions().device(at::kCUDA);
+  auto byte_options = base_options.dtype(at::kByte);
+  auto half_options = base_options.dtype(at::kHalf);
+  auto float_options = base_options.dtype(at::kFloat);
+  flat_grads = at::zeros({total_param_size}, half_options);
+  new_params = at::zeros({total_param_size}, options.e5m2_allgather() ?
+    byte_options : half_options);
+  fp32_p = at::zeros({mega_shard_size}, float_options);
+  fp32_m = at::zeros({mega_shard_size}, float_options);
+  fp32_v = at::zeros({mega_shard_size}, float_options);
+  // FIXME: Rethink fp16 label since it's either uint8 or fp16
+  fp16_p = at::zeros({mega_shard_size}, options.e5m2_allgather() ?
+    byte_options : half_options);
+  fp16_g = at::zeros({mega_shard_size}, half_options);
 
-  // Now start the TCP store daemon on the rank 0
-  auto tensor_options = at::TensorOptions().dtype(at::kHalf).device(at::kCUDA);
-  at::Tensor tensor = at::empty({8, 8}, tensor_options);
-  std::vector<at::Tensor> tensors;
-  tensors.push_back(tensor);
-  std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
-  work->wait();
+  for (int i=0; i<p_i; i++) {
+    long start = grads_info[i].second;
+    long stop = start + grads_info[i].first;
+    auto fgrads = flat_grads.index({Slice(start, stop)});
+    individual_flat_grads.push_back(fgrads.view_as(model_params[i]));
+  }
+
+  // Gradients organized as: blocks x chunks x groups
+  for (int idx_b=0; idx_b<options.num_blocks(); idx_b++) { // blocks
+    long start = idx_b * options.block_size();
+    long stop = start + options.block_size();
+    auto _block = flat_grads.index({Slice(start, stop)});
+    flat_grads_blocks.push_back(_block);
+
+    std::vector<at::Tensor> _chunks;
+    std::vector<std::vector<at::Tensor> > _shards;
+    for (int idx_c=0; idx_c<options.num_chunks(); idx_c++) { // chunks
+      long start = idx_c * options.chunk_size();
+      long stop = start + options.chunk_size();
+      auto _chunk = _block.index({Slice(start, stop)});
+      _chunks.push_back(_chunk);
+
+      std::vector<at::Tensor> __shards;
+      for (int idx_s=0; idx_s<options.group_size(); idx_s++) { // shards
+        long start = idx_s * options.shard_size();
+        long stop = start + options.shard_size();
+        auto _shard = _chunk.index({Slice(start, stop)});
+        __shards.push_back(_shard);
+      }
+      _shards.push_back(__shards);
+    }
+    flat_grads_chunks.push_back(_chunks);
+    flat_grads_shards.push_back(_shards);
+  }
+
+  // Parameters organized as: groups x blocks x chunks
+  for (int idx_s=0; idx_s<options.group_size(); idx_s++) { // shards
+    long start = idx_s * mega_shard_size;
+    long stop = start + mega_shard_size;
+    auto _shard = new_params.index({Slice(start, stop)});
+    new_params_mega_shards.push_back(_shard);
+
+    std::vector<at::Tensor> _blocks;
+    std::vector<std::vector<at::Tensor> > _chunks;
+    for (int idx_b=0; idx_b<options.num_blocks(); idx_b++) { // blocks
+      long start = idx_b * options.num_chunks() * options.shard_size();
+      long stop = start + options.num_chunks() *options.shard_size();
+      auto _block = _shard.index({Slice(start, stop)});
+      _blocks.push_back(_block);
+
+      std::vector<at::Tensor> __chunks;
+      for (int idx_c=0; idx_c<options.num_chunks(); idx_c++) { // chunks
+        long start = idx_c * options.shard_size();
+        long stop = start + options.shard_size();
+        auto _chunk = _block.index({Slice(start, stop)});
+        __chunks.push_back(_chunk);
+      }
+      _chunks.push_back(__chunks);
+    }
+    new_params_mega_blocks.push_back(_blocks);
+    new_params_mega_chunks.push_back(_chunks);
+  }
+
+  // Packed states organized as: blocks x chunks
+  auto _packed_split = [this](std::vector<at::Tensor>& p_blocks,
+      std::vector<std::vector<at::Tensor> >& p_chunks, at::Tensor &p) {
+    for (int idx_b=0; idx_b<options.num_blocks(); idx_b++) { // blocks
+      long start = idx_b * options.num_chunks() * options.shard_size();
+      long stop = start + options.num_chunks() * options.shard_size();
+      auto _p_block = p.index({Slice(start, stop)});
+      p_blocks.push_back(_p_block);
+
+      /** In the packed format, each chunk contains one shard, so
+       *  packed_chunk_size == shard_size.
+       */
+      std::vector<at::Tensor> _p_chunks;
+      for (int idx_c=0; idx_c<options.num_chunks(); idx_c++) { // chunks
+        long start = idx_c * options.shard_size();
+        long stop = start + options.shard_size();
+        auto _p_chunk = _p_block.index({Slice(start, stop)});
+        _p_chunks.push_back(_p_chunk);
+      }
+      p_chunks.push_back(_p_chunks);
+    }
+  };
+  _packed_split(fp32_p_blocks, fp32_p_chunks, fp32_p);
+  _packed_split(fp32_m_blocks, fp32_m_chunks, fp32_m);
+  _packed_split(fp32_v_blocks, fp32_v_chunks, fp32_v);
+  _packed_split(fp16_p_blocks, fp16_p_chunks, fp16_p);
+  _packed_split(fp16_g_blocks, fp16_g_chunks, fp16_g);
+
+  /** This paragraph does two things:
+   *  1) Copy model parameters into master buffer
+   *  2) Create tensor lists for unpacking new parameter tensor after all-gather
+   */
+  std::vector<at::Tensor> _p_in, _p_out;
+  for (int shard_id=0; shard_id<options.group_size(); shard_id++) {
+    for (int block_id=0; block_id<options.num_blocks(); block_id++) {
+      for (int chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
+        long flat_shard_start = ((block_id * options.num_blocks() + chunk_id)
+          * options.group_size() + shard_id) * options.shard_size();
+        long flat_shard_end = flat_shard_start + options.shard_size();
+        for (int p_idx=0; p_idx<p_i; p_idx++) {
+          long flat_grad_start = grads_info[p_idx].second;
+          long flat_grad_end = flat_grad_start + grads_info[p_idx].first;
+          long clipped_start = std::max(flat_grad_start, flat_shard_start);
+          long clipped_end = std::min(flat_grad_end, flat_shard_end);
+
+          if (clipped_start >= clipped_end)  continue;
+
+          long grad_offset = clipped_start - flat_grad_start;
+          long grad_length = clipped_end - clipped_start;
+          long shard_offset = clipped_start - flat_shard_start;
+          auto model_param_fragment = model_params[p_idx].view(-1).index(
+            {Slice(grad_offset, grad_offset+grad_length)});
+          auto new_param_packed_fragment = new_params_mega_chunks \
+            [shard_id][block_id][chunk_id].index({Slice(
+            shard_offset, shard_offset+grad_length)});
+          _p_in.push_back(new_param_packed_fragment);
+          _p_out.push_back(model_param_fragment);
+
+          // Copy model parameters into master buffer
+          if (shard_id == options.rank_in_group()) {
+            auto master_param_fragment = fp32_p_chunks[block_id][chunk_id] \
+              .index({Slice(shard_offset, shard_offset+grad_length)});
+            master_param_fragment.copy_(model_param_fragment);
+
+            LOGGING("Sizes: model_param_fragment=%ld, new_param_packed_fragment=%ld"
+              ", master_param_fragment=%ld\n", model_param_fragment.numel(),
+              new_param_packed_fragment.numel(), master_param_fragment.numel());
+          }
+        }
+      }
+    }
+  }
+  packed_flat_to_model_params.push_back(_p_in);
+  packed_flat_to_model_params.push_back(_p_out);
+   
+  /** Build process groups and CUDA streams.
+   *  Ranks not in the process group are not necessary to participate
+   *  communicator construction in c10d C++ API.
+   */
+  char _pg_name[PG_NAME_LEN];
+  std::vector<at::Tensor> _tensors = {at::zeros({1}, float_options)};
+  if (options.num_groups() > 1) {
+    for (int i=0; i<options.num_ar_pg(); i++) {
+      std::snprintf(_pg_name, PG_NAME_LEN, "ar_pg_%ld_%d",
+        options.rank_in_group(), i);
+      auto prefix_store = std::make_shared<PrefixStore>(_pg_name, store);
+      auto _ar_pg = std::make_shared<ProcessGroupNCCL>(prefix_store,
+        options.group_rank(), options.num_groups(), timeout);
+
+      LOGGING("Building process group %s: world_size %ld, rank %ld\n",
+        _pg_name, options.num_groups(), options.group_rank());
+
+      /** For faster initialization.
+       *  NCCL communicators are lazy initialized in c10d, and c10d keeps
+       *  a reference to the store.
+       */
+      std::shared_ptr<ProcessGroup::Work> work = _ar_pg->allreduce(_tensors);
+      work->wait();
+    
+      ar_pg.emplace_back(_ar_pg);
+      ar_st.emplace_back(at::cuda::getStreamFromPool());
+    }
+    cudaDeviceSynchronize();
+  }
+
+  // Re-use reduce-scatter process group for all-gather if num_ag_pg is 0
+  for (int i=0; i<options.num_rs_pg(); i++) {
+    std::snprintf(_pg_name, PG_NAME_LEN, "rs_pg_%ld_%d",
+      options.group_rank(), i);
+    auto prefix_store = std::make_shared<PrefixStore>(_pg_name, store);
+    auto _rs_pg = std::make_shared<ProcessGroupNCCL>(prefix_store,
+      options.rank_in_group(), options.group_size(), timeout);
+
+    LOGGING("Building process group %s: world_size %ld, rank %ld\n",
+      _pg_name, options.group_size(), options.rank_in_group());
+
+    std::shared_ptr<ProcessGroup::Work> work = _rs_pg->allreduce(_tensors);
+    work->wait();
+
+    rs_pg.push_back(_rs_pg);
+    rs_st.emplace_back(at::cuda::getStreamFromPool());
+    if (options.num_ag_pg() == 0) {
+      ag_pg.push_back(_rs_pg);
+      ag_st.emplace_back(at::cuda::getStreamFromPool());
+    }
+  }
+  cudaDeviceSynchronize();
+  if (options.num_ag_pg() != 0) {
+    for (int i=0; i<options.num_ag_pg(); i++) {
+      std::snprintf(_pg_name, PG_NAME_LEN, "ag_pg_%ld_%d",
+        options.group_rank(), i);
+      auto prefix_store = std::make_shared<PrefixStore>(_pg_name, store);
+      auto _ag_pg = std::make_shared<ProcessGroupNCCL>(prefix_store,
+        options.rank_in_group(), options.group_size(), timeout);
+
+      LOGGING("Building process group %s: world_size %ld, rank %ld\n",
+        _pg_name, options.group_size(), options.rank_in_group());
+
+      std::shared_ptr<ProcessGroup::Work> work = _ag_pg->allreduce(_tensors);
+      work->wait();
+
+      ag_pg.emplace_back(_ag_pg);
+      ag_st.emplace_back(at::cuda::getStreamFromPool());
+    }
+    cudaDeviceSynchronize();
+  }
+
+  // Process group for L2 gradient norm
+  std::snprintf(_pg_name, PG_NAME_LEN, "l2_grad_norm_pg_%ld",
+    options.group_rank());
+  auto l2_grad_norm_prefix_store = std::make_shared<PrefixStore>(_pg_name,
+    store);
+  l2_grad_norm_pg = std::make_unique<ProcessGroupNCCL>(
+    l2_grad_norm_prefix_store, options.rank_in_group(), options.group_size(),
+    timeout);
+  LOGGING("Building process group %s: world_size %ld, rank %ld\n",
+    _pg_name, options.group_size(), options.rank_in_group());
+  std::shared_ptr<ProcessGroup::Work> _l2_grad_norm_work =
+    l2_grad_norm_pg->allreduce(_tensors);
+  _l2_grad_norm_work->wait();
+  cudaDeviceSynchronize();
 
   LOGGING("DistributedFusedAdam init done.\n");
 }

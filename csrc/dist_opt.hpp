@@ -2,8 +2,15 @@
 
 #include <torch/extension.h>
 #include <ATen/ATen.h>
+#include <THC/THC.h>
 
 #include <limits>
+
+#include "../c10d/ProcessGroupNCCL.hpp"
+#include "../c10d/TCPStore.hpp"
+#include "../c10d/PrefixStore.hpp"
+
+using namespace c10d;
 
 // Hook on AccumulateGrad by default
 #undef DIST_OPT_HOOK_TENSOR
@@ -42,6 +49,7 @@ struct DistributedOptimizerOptions {
   TORCH_ARG(int, master_port);
   TORCH_ARG(long, group_size) = 0;
   TORCH_ARG(long, num_groups);
+  TORCH_ARG(long, group_rank);
   TORCH_ARG(long, rank_in_group);
   TORCH_ARG(long, net_total_param_size);
   TORCH_ARG(long, block_size);
@@ -142,5 +150,53 @@ class DistributedFusedAdam : public torch::optim::Adam {
     std::vector<bool> grads_generated;
     // Param index that will invoke gradient reductions
     std::vector<long> low_param_i;
+
+    // Flattened parameters, gradients, states
+    at::Tensor flat_grads;
+    at::Tensor new_params;
+    at::Tensor fp32_p;
+    at::Tensor fp32_m;
+    at::Tensor fp32_v;
+    at::Tensor fp16_p;
+    at::Tensor fp16_g;
+    std::vector<at::Tensor> individual_flat_grads;
+
+    std::vector<at::Tensor> flat_grads_blocks;
+    std::vector<std::vector<at::Tensor> > flat_grads_chunks;
+    std::vector<std::vector<std::vector<at::Tensor> > > flat_grads_shards;
+    std::vector<at::Tensor> new_params_mega_shards;
+    std::vector<std::vector<at::Tensor> > new_params_mega_blocks;
+    std::vector<std::vector<std::vector<at::Tensor> > > new_params_mega_chunks;
+    std::vector<at::Tensor> fp32_p_blocks;
+    std::vector<std::vector<at::Tensor> > fp32_p_chunks;
+    std::vector<at::Tensor> fp32_m_blocks;
+    std::vector<std::vector<at::Tensor> > fp32_m_chunks;
+    std::vector<at::Tensor> fp32_v_blocks;
+    std::vector<std::vector<at::Tensor> > fp32_v_chunks;
+    std::vector<at::Tensor> fp16_p_blocks;
+    std::vector<std::vector<at::Tensor> > fp16_p_chunks;
+    std::vector<at::Tensor> fp16_g_blocks;
+    std::vector<std::vector<at::Tensor> > fp16_g_chunks;
+
+    std::vector<std::vector<at::Tensor> > packed_flat_to_model_params;
+
+    // CUDA streams for NCCL and optimizer
+    std::vector<at::cuda::CUDAStream> rs_st;
+    std::vector<at::cuda::CUDAStream> ar_st;
+    std::vector<at::cuda::CUDAStream> ag_st;
+    at::cuda::CUDAStream l2_grad_norm_st;
+    at::cuda::CUDAStream completion_st;
+
+    // Process groups for NCCL
+    std::vector<std::shared_ptr<ProcessGroupNCCL> > ar_pg;
+    std::vector<std::shared_ptr<ProcessGroupNCCL> > rs_pg;
+    std::vector<std::shared_ptr<ProcessGroupNCCL> > ag_pg;
+
+    // No default constructor
+    std::unique_ptr<ProcessGroupNCCL> l2_grad_norm_pg;
+
+    // Works for pre and post communication
+    std::vector<std::shared_ptr<ProcessGroup::Work> > reductions_works;
+    std::vector<std::shared_ptr<ProcessGroup::Work> > allgather_works;
 };
 
