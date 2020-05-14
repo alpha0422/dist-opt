@@ -1,4 +1,7 @@
 #include "dist_opt.hpp"
+#include "fused_adam_cuda.hpp"
+
+#include <cmath>
 
 using torch::indexing::Slice;
 
@@ -10,6 +13,7 @@ using namespace pybind11::literals;
 
 #define PG_NAME_LEN 128
 #define NCCL_TIME_OUT (120 * 1000)
+#define MT_CHUNK_SIZE (2048 * 32) // apex/apex/multi_tensor_apply/__init__.py
 
 #define LOGGING(fmt, ...) do { \
   if (options.logging()) { \
@@ -102,9 +106,11 @@ DistributedFusedAdam::DistributedFusedAdam(
         torch::optim::AdamOptions(_lr)
           .betas(_betas).weight_decay(_weight_decay)
           .eps(_eps).amsgrad(_amsgrad)),
-      current_block(_overlap_reductions ? _dwu_num_blocks : -1),
+      _current_block(_overlap_reductions ? _dwu_num_blocks : -1),
       l2_grad_norm_st(at::cuda::getStreamFromPool()),
-      completion_st(at::cuda::getStreamFromPool()) {
+      completion_st(at::cuda::getStreamFromPool()),
+      l2_grad_norm_event(at::cuda::CUDAEvent()),
+      completion_event(at::cuda::CUDAEvent()) {
 
   options.bias_correction(_bias_correction)
          .eps_mode(_eps_inside_sqrt ? 0 : 1)
@@ -491,7 +497,212 @@ DistributedFusedAdam::DistributedFusedAdam(
   _l2_grad_norm_work->wait();
   cudaDeviceSynchronize();
 
+  // Create events for synchronization, and vector to store works
+  for (long i=0; i<options.num_blocks(); i++) {
+    reductions_works.push_back(std::vector<std::shared_ptr<
+      ProcessGroup::Work> >());
+    reduction_start.push_back(std::vector<at::cuda::CUDAEvent>());
+    for (long j=0; j<options.num_chunks(); j++) {
+      reduction_start[i].push_back(at::cuda::CUDAEvent());
+    }
+  }
+  for (size_t i=0; i<ag_st.size(); i++) {
+    reduction_finish.push_back(at::cuda::CUDAEvent());
+  }
+
   LOGGING("DistributedFusedAdam init done.\n");
+}
+
+void DistributedFusedAdam::set_last_step(bool last_step) {
+  _last_step = last_step;
+}
+
+std::pair<long, long> DistributedFusedAdam::get_flush_block() {
+  // Use -1 to denote empty flush block
+  auto flush_block = std::make_pair<long, long>(-1 ,-1);
+
+  if (_current_block > 0 && grads_generated[low_param_i[_current_block-1]]) {
+    long num_grads = grads_generated.size();
+    long contiguous_idx = num_grads;
+    while (contiguous_idx > 0 && grads_generated[contiguous_idx-1]) {
+      contiguous_idx--;
+    }
+
+    if (contiguous_idx < num_grads && grads_info[contiguous_idx].second <=
+        (_current_block - 1) * options.block_size()) {
+      _current_block--;
+      long start = _current_block * options.block_size();
+      long end = (_current_block + 1) * options.block_size();
+      flush_block = std::make_pair(start, end);
+    }
+  }
+
+  return flush_block;
+}
+
+void DistributedFusedAdam::pipeline_block_reductions(long block_id) {
+  flatten_grad_mt(options.predivide() ? (1.0 / options.world_size()) : 1.0);
+
+  /** Reduction within each node
+   *  Changes gradient format from [block * chunk * shard] to [shard * block * chunk]
+   *  The output format is the same as the fp32 master parameters
+   */
+  reductions_works[block_id].clear();
+  for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
+    long glob_chunk_id = block_id * options.num_chunks() + chunk_id;
+    auto rs_stream = rs_st[glob_chunk_id % options.num_rs_pg()];
+    auto current_stream = at::cuda::getCurrentCUDAStream();
+    reduction_start[block_id][chunk_id].record(current_stream);
+    reduction_start[block_id][chunk_id].block(rs_stream);
+    
+    at::cuda::CUDAStreamGuard guard(rs_stream);
+    auto _rs_pg = rs_pg[glob_chunk_id % options.num_rs_pg()];
+    std::vector<at::Tensor> outputTensors;
+    std::vector<std::vector<at::Tensor>> inputTensors;
+    outputTensors.emplace_back(fp16_g_chunks[block_id][chunk_id]);
+    inputTensors.emplace_back(flat_grads_shards[block_id][chunk_id]);
+    ReduceScatterOptions _opt;
+    _opt.noCopy = true;
+
+    std::shared_ptr<ProcessGroup::Work> _work = _rs_pg->reduce_scatter(
+      outputTensors, inputTensors, _opt);
+    reductions_works[block_id].push_back(_work);
+  }
+
+  // Reduction across nodes for each rank
+  if (options.num_groups() > 1) {
+    for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
+      long glob_chunk_id = block_id * options.num_chunks() + chunk_id;
+      auto ar_stream = ar_st[glob_chunk_id % options.num_ar_pg()];
+
+      at::cuda::CUDAStreamGuard guard(ar_stream);
+      reductions_works[block_id][chunk_id]->wait();
+      auto _ar_pg = ar_pg[glob_chunk_id % options.num_ar_pg()];
+      std::vector<at::Tensor> tensors;
+      tensors.emplace_back(fp16_g_chunks[block_id][chunk_id]);
+      std::shared_ptr<ProcessGroup::Work> _work = _ar_pg->allreduce(tensors);
+      reductions_works[block_id][chunk_id] = _work;
+    }
+  }
+
+  // Optionally compute L2 grad norm
+  if (options.compute_L2_grad_norm() && block_id == 0) {
+    at::cuda::CUDAStreamGuard guard(l2_grad_norm_st);
+    for (long block_id=0; block_id<options.num_blocks(); block_id++) {
+      for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
+        reductions_works[block_id][chunk_id]->wait();
+      }
+    }
+
+    // Since the packed format is contiguous after reductions, only one norm
+    // is needed
+    at::Tensor l2_grad_norm_sq = fp16_g.norm(2, at::kFloat).square_();
+    std::vector<at::Tensor> tensors;
+    tensors.emplace_back(l2_grad_norm_sq);
+    std::shared_ptr<ProcessGroup::Work> _work = l2_grad_norm_pg->
+      allreduce(tensors);
+    _work->wait();
+    _L2_grad_norm.copy_(l2_grad_norm_sq.sqrt_());
+  }
+}
+
+void DistributedFusedAdam::launch_step_kernel(at::Tensor p, at::Tensor p_copy,
+    at::Tensor m, at::Tensor v, at::Tensor g) {
+  float combined_scale = _global_scale;
+  float l2_grad_norm = L2_grad_norm();
+  if (options.max_grad_norm() > 0 && std::isfinite(l2_grad_norm)) {
+    combined_scale = options.max_grad_norm() / (l2_grad_norm / _global_scale
+      + 1e-6);
+    combined_scale = _global_scale / std::min(1.0f, combined_scale);
+  }
+  /** Notice: the bias_correction is global here. */
+  int bias_correction = options.bias_correction() ? 1 : 0;
+  auto& group_options = static_cast<torch::optim::AdamOptions&>(
+    param_groups()[0].options());
+  auto& param_state = static_cast<DistributedFusedAdamParamState&>(
+    *state_[c10::guts::to_string(model_params[0].unsafeGetTensorImpl())]);
+  reversible_adam(p, p_copy, m, v, g,
+    group_options.lr(),
+    std::get<0>(group_options.betas()),
+    std::get<1>(group_options.betas()),
+    group_options.eps(),
+    combined_scale,
+    param_state.step() + 1,
+    options.eps_mode(),
+    bias_correction,
+    group_options.weight_decay());
+}
+
+void DistributedFusedAdam::pipeline_block_step(long block_id) {
+  // Call step kernel once per block
+  auto ag_stream = ag_st[block_id % options.num_ag_pg()];
+  {
+    at::cuda::CUDAStreamGuard guard(ag_stream);
+    for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
+      reductions_works[block_id][chunk_id]->wait();
+    }
+    launch_step_kernel(
+      fp32_p_blocks[block_id],
+      fp16_p_blocks[block_id],
+      fp32_m_blocks[block_id],
+      fp32_v_blocks[block_id],
+      fp16_g_blocks[block_id]);
+  }
+
+  /* Call all-gather once per step.
+   * FIXME: Determine which is faster, one all-gather per block or a single
+   * all-gather at the end.
+   */
+  if (block_id == 0) {
+    for (size_t i=0; i<ag_st.size(); i++) {
+      reduction_finish[i].record(ag_st[i]);
+      reduction_finish[i].block(completion_st);
+    }
+
+    at::cuda::CUDAStreamGuard guard(completion_st);
+    std::vector<std::vector<at::Tensor>> outputTensors;
+    std::vector<at::Tensor> inputTensors;
+    outputTensors.emplace_back(new_params_mega_shards);
+    inputTensors.emplace_back(fp16_p);
+    AllgatherOptions _opt;
+    _opt.noCopy = true;
+
+    std::shared_ptr<ProcessGroup::Work> _work = ag_pg[0]->allgather(
+      outputTensors, inputTensors, _opt);
+    _work->wait();
+  }
+}
+
+void DistributedFusedAdam::pipeline_step() {
+  // Call step kernel once per step
+  // Call all-gather once per step
+  at::cuda::CUDAStreamGuard guard(completion_st);
+  for (long block_id=0; block_id<options.num_blocks(); block_id++) {
+    for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
+      reductions_works[block_id][chunk_id]->wait();
+    }
+  }
+
+  launch_step_kernel(fp32_p, fp16_p, fp32_m, fp32_v, fp16_g);
+
+  std::vector<std::vector<at::Tensor>> outputTensors;
+  std::vector<at::Tensor> inputTensors;
+  outputTensors.emplace_back(new_params_mega_shards);
+  inputTensors.emplace_back(fp16_p);
+  AllgatherOptions _opt;
+  _opt.noCopy = true;
+
+  std::shared_ptr<ProcessGroup::Work> _work = ag_pg[0]->allgather(
+    outputTensors, inputTensors, _opt);
+  _work->wait();
+}
+
+void DistributedFusedAdam::flatten_grad_mt(float scale) {
+  if (options.flat_mt() && !grads.empty()) {
+    _overflow_buf.zero_();
+    multi_tensor_scale_cuda(MT_CHUNK_SIZE, _overflow_buf, grads, scale);
+    grads.clear();
+  }
 }
 
 void DistributedFusedAdam::do_overlapped_reduction(long param_i,
@@ -499,15 +710,203 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
   auto& param_state = static_cast<DistributedFusedAdamParamState&>(
       *state_[c10::guts::to_string(
       model_params[0].unsafeGetTensorImpl())]);
-  if (param_state.step() == 0)
+  if (param_state.step() == 0) {
     LOGGING("invoke hook param %ld start at %ld size %ld\n", param_i,
         param_offset, param_grads_size);
+  }
+
+  // handle overlapped reductions
+  if (options.flat_mt()) {
+    if (grads.empty()) {
+      grads.push_back(std::vector<at::Tensor>());
+      grads.push_back(std::vector<at::Tensor>());
+    }
+
+    grads[0].push_back(param.grad());
+    grads[1].push_back(individual_flat_grads[param_i]);
+  } else {
+    // FIXME: seems no C++ scalar division API
+    at::Tensor _coeff = torch::tensor({options.predivide() ?
+      options.world_size() : 1.0});
+    at::div_out(param.grad(), _coeff, individual_flat_grads[param_i]);
+  }
+
+  grads_generated[param_i] = true;
+  if (!_last_step and options.overlap_reductions()) {
+    auto flush_block = get_flush_block();
+    while (flush_block.first != -1) {
+      long block_id = flush_block.first / options.block_size();
+      pipeline_block_reductions(block_id);
+      if (options.full_pipeline()) {
+        pipeline_block_step(block_id);
+      }
+      flush_block = get_flush_block();
+    }
+  }
 }
 
-torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr) {
-  auto& group_options = static_cast<torch::optim::AdamOptions&>(param_groups()[0].options());
-  std::cout << group_options.lr() << std::endl;
-  return torch::empty({});
+/** Set global scale. */
+void DistributedFusedAdam::set_global_scale(double global_scale) {
+  _global_scale = global_scale; 
+}
+
+double DistributedFusedAdam::global_scale() {
+  return _global_scale;
+}
+
+/** Check if overflows were detected by any call to step(...) method.
+ *  Clears the overflow flag.
+ */
+bool DistributedFusedAdam::has_overflow() {
+  bool has_overflow = _has_overflow;
+  _has_overflow = false;
+  return has_overflow;
+}
+
+/** Check if overflows were detected by any call to step(...) method.
+ *  Does not clear overflow flag.
+ */
+bool DistributedFusedAdam::peek_overflow() {
+  return _has_overflow;
+}
+
+/** Strided check for overflow.
+ *  You can get status by calling has_overflow.
+ */
+bool DistributedFusedAdam::_strided_check_finite(at::Tensor output_params,
+    int stride=1, int start=-1, int end=-1, bool clear=true) {
+  at::Tensor out_p;
+  if (start >= 0 && start < end) {
+    out_p = output_params.index({Slice(start, end)});
+  } else {
+    out_p = output_params;
+  }
+
+  strided_check_finite(_overflow_buf, out_p, stride, clear ? 1 : 0);
+  _has_overflow = (_overflow_buf.item<long>() != 0);
+  return _has_overflow;
+}
+
+float DistributedFusedAdam::L2_grad_norm() {
+  if (options.compute_L2_grad_norm()) {
+    auto current_stream = at::cuda::getCurrentCUDAStream();
+    l2_grad_norm_event.record(l2_grad_norm_st);
+    l2_grad_norm_event.block(current_stream);
+    return _L2_grad_norm.item<float>();
+  }
+  return NAN;
+}
+
+/** Complete reductions if full pipeline is not selected or overlap
+ *  is not allowed.
+ */
+void DistributedFusedAdam::complete_reductions() {
+  if (_last_step) {
+    // zero out gradients that have not been completed yet
+    for (size_t param_i=0; param_i<grads_generated.size(); param_i++) {
+      bool grad_generated = grads_generated[param_i];
+      if (!grad_generated) {
+        auto grad_info = grads_info[param_i];
+        long start = grad_info.second;
+        long stop = grad_info.first + grad_info.second;
+        flat_grads.index({Slice(start, stop)}).zero_();
+        grads_generated[param_i] = true;
+      }
+    }
+  }
+
+  if (_last_step || !options.overlap_reductions()) {
+    // nothing done so far, run full pipeline after reductions
+    for (long block_id=options.num_blocks()-1; block_id>=0; block_id--) {
+      pipeline_block_reductions(block_id);
+    }
+  }
+
+  if (options.compute_L2_grad_norm()) {
+    auto current_stream = at::cuda::getCurrentCUDAStream();
+    l2_grad_norm_event.record(l2_grad_norm_st);
+    l2_grad_norm_event.block(current_stream);
+  }
+
+  _current_block = options.num_blocks();
+  std::fill(grads_generated.begin(), grads_generated.end(), false);
+}
+
+/** Revert effect of previously calling partial_step. */
+void DistributedFusedAdam::revert_step() {
+  // Call undo kernel once per step
+  float combined_scale = _global_scale;
+  float l2_grad_norm = L2_grad_norm();
+  if (options.max_grad_norm() > 0 && std::isfinite(l2_grad_norm)) {
+    combined_scale = options.max_grad_norm() / (l2_grad_norm / _global_scale
+      + 1e-6);
+    combined_scale = _global_scale / std::min(1.0f, combined_scale);
+  }
+  /** Notice: the bias_correction is global here. */
+  int bias_correction = options.bias_correction() ? 1 : 0;
+  auto& group_options = static_cast<torch::optim::AdamOptions&>(
+    param_groups()[0].options());
+  auto& param_state = static_cast<DistributedFusedAdamParamState&>(
+    *state_[c10::guts::to_string(model_params[0].unsafeGetTensorImpl())]);
+  at::Tensor overflow_flag = at::empty({0});
+  maybe_adam_undo(
+    overflow_flag,
+    fp32_p, fp32_m, fp32_v, fp16_g,
+    group_options.lr(),
+    std::get<0>(group_options.betas()),
+    std::get<1>(group_options.betas()),
+    group_options.eps(),
+    combined_scale,
+    param_state.step() + 1,
+    options.eps_mode(),
+    bias_correction,
+    group_options.weight_decay());
+}
+
+torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr,
+    bool skip_overflow_check=false) {
+  at::Tensor loss;
+  if (closure != nullptr) {
+    loss = closure();
+  }
+
+  if (_last_step || !options.overlap_reductions() || !options.full_pipeline()) {
+    pipeline_step();
+  }
+
+  {
+    at::cuda::CUDAStreamGuard guard(completion_st);
+
+    // Check for overflow
+    // Store state for loss scaler calculation
+    bool has_overflow = false;
+    if (!skip_overflow_check) {
+      // Notice the name conflict
+      _strided_check_finite(new_params, options.shard_size(), 0,
+        options.net_total_param_size());
+    }
+    if (has_overflow) {
+      revert_step();
+    } else {
+      // Copy _new_params to model params
+      for (auto p : model_params) {
+        auto& state = static_cast<DistributedFusedAdamParamState&>(
+            *state_[c10::guts::to_string(p.unsafeGetTensorImpl())]);
+        state.step(state.step()+1);
+      }
+      maybe_cast_cuda_mt(MT_CHUNK_SIZE, _overflow_buf,
+        packed_flat_to_model_params);
+    }
+  }
+  
+  auto current_stream = at::cuda::getCurrentCUDAStream();
+  completion_event.record(completion_st);
+  completion_event.block(current_stream);
+
+  std::fill(reductions_works.begin(), reductions_works.end(),
+    std::vector<std::shared_ptr<ProcessGroup::Work> >());
+
+  return loss;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -543,5 +942,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "predivide"_a=true,
       "e5m2_allgather"_a=false,
       "do_not_flatten_model"_a=false)
-    .def("step", &DistributedFusedAdam::step, "closure"_a=nullptr);
+    .def("set_last_step", &DistributedFusedAdam::set_last_step, "last_step"_a)
+    .def("set_global_scale", &DistributedFusedAdam::set_global_scale,
+      "global_scale"_a)
+    .def("global_scale", &DistributedFusedAdam::global_scale)
+    .def("has_overflow", &DistributedFusedAdam::has_overflow)
+    .def("peek_overflow", &DistributedFusedAdam::peek_overflow)
+    .def("L2_grad_norm", &DistributedFusedAdam::L2_grad_norm)
+    .def("complete_reductions", &DistributedFusedAdam::complete_reductions)
+    .def("revert_step", &DistributedFusedAdam::revert_step)
+    .def("step", &DistributedFusedAdam::step, "closure"_a=nullptr,
+      "skip_overflow_check"_a=false);
 }

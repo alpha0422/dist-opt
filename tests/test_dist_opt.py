@@ -5,6 +5,8 @@ import socket
 import torch
 import torch.multiprocessing as mp
 import unittest
+import apex
+import amp_C
 from distopt import DistributedFusedAdam
 
 class DistributedFusedAdamTest(unittest.TestCase):
@@ -43,10 +45,13 @@ def _test_mp_dist_opt_simple(rank, world_size, port):
     _multi_process_setup(world_size, rank, port)
 
     model = torch.nn.LSTM(1024, 1024).cuda().half()
+    #model = torch.nn.Sequential(*(torch.nn.Linear(1024, 1024) for _ in range(12)))
+    #model = model.cuda().half()
     params = list(model.parameters())
-    opt = DistributedFusedAdam(params, lr=1e-2)
+    opt = DistributedFusedAdam(params, lr=1e-2, dwu_num_rs_pg=4, dwu_group_size=4)
 
     x0 = torch.zeros((38, 16, 1024), device='cuda', dtype=torch.half)
+    #x0 = torch.zeros((16, 1024), device='cuda', dtype=torch.half)
     y0, _ = model(x0)
     dy = torch.zeros_like(y0)
     y0.backward(dy)

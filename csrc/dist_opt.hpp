@@ -74,6 +74,9 @@ class AccGradPostHook;
  * environment variables WORLD_SIZE, RANK, LOCAL_RANK, MASTER_ADDR, MASTER_PORT
  * are set correctly:
  *
+ *   import torch
+ *   import apex, amp_C
+ *
  *   torch.distributed.init_process_group(backend='nccl', init_method="env://")
  *   assert torch.distributed.is_initialized()
  *   world_size = torch.distributed.get_world_size()
@@ -116,29 +119,47 @@ class DistributedFusedAdam : public torch::optim::Adam {
           bool _e5m2_allgather,
           bool _do_not_flatten_model);
     ~DistributedFusedAdam() {}
-    torch::Tensor step(LossClosure closure) override;
+    void set_last_step(bool last_step);
+    void set_global_scale(double global_scale);
+    double global_scale();
+    bool has_overflow();
+    bool peek_overflow();
+    float L2_grad_norm();
+    void complete_reductions();
+    void revert_step();
+    // FIXME: this step() doesn't override the inherited one
+    torch::Tensor step(LossClosure closure, bool skip_overflow_check);
 
   protected:
 #ifndef DIST_OPT_HOOK_TENSOR
     friend class AccGradPostHook;
 #endif
+    std::pair<long, long> get_flush_block();  // (start, end)
+    void pipeline_block_reductions(long block_id);
+    void launch_step_kernel(at::Tensor p, at::Tensor p_copy, at::Tensor m,
+      at::Tensor v, at::Tensor g);
+    void pipeline_block_step(long block_id);
+    void pipeline_step();
+    void flatten_grad_mt(float scale);
     void do_overlapped_reduction(long param_i, long param_grads_size,
-        long param_offset, at::Tensor &param);
+      long param_offset, at::Tensor &param);
+    bool _strided_check_finite(at::Tensor output_params, int stride,
+      int start, int end, bool clear);
 
   private:
     DistributedOptimizerOptions options;
 
     // Distributed optimizer specifics
-    int current_block;
+    int _current_block;
     bool _last_step = false;
     // Must set global scale first
     double _global_scale = std::numeric_limits<double>::quiet_NaN();
     bool _has_overflow = false;
 
     at::Tensor _overflow_buf = at::zeros({1}, at::TensorOptions().dtype(at::kLong)
-        .device(at::kCUDA));
+      .device(at::kCUDA));
     at::Tensor _L2_grad_norm = at::zeros({1}, at::TensorOptions().dtype(at::kFloat)
-        .device(at::kCUDA));
+      .device(at::kCUDA));
 
     // Pair of (param_grads_size, param_offset)
     std::vector<std::pair<int64_t, int64_t> > grads_info;
@@ -146,7 +167,7 @@ class DistributedFusedAdam : public torch::optim::Adam {
 #ifndef DIST_OPT_HOOK_TENSOR
     std::vector<std::shared_ptr<torch::autograd::Node> > grad_accs;
 #endif
-    std::vector<at::Tensor*> grads;
+    std::vector<std::vector<at::Tensor> > grads;
     std::vector<bool> grads_generated;
     // Param index that will invoke gradient reductions
     std::vector<long> low_param_i;
@@ -195,8 +216,14 @@ class DistributedFusedAdam : public torch::optim::Adam {
     // No default constructor
     std::unique_ptr<ProcessGroupNCCL> l2_grad_norm_pg;
 
-    // Works for pre and post communication
-    std::vector<std::shared_ptr<ProcessGroup::Work> > reductions_works;
-    std::vector<std::shared_ptr<ProcessGroup::Work> > allgather_works;
+    // Works for pre communication
+    std::vector<std::vector<std::shared_ptr<ProcessGroup::Work> > >
+      reductions_works;
+
+    // CUDA events for synchronization
+    std::vector<std::vector<at::cuda::CUDAEvent> > reduction_start;
+    std::vector<at::cuda::CUDAEvent> reduction_finish;
+    at::cuda::CUDAEvent l2_grad_norm_event;
+    at::cuda::CUDAEvent completion_event;
 };
 
