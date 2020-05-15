@@ -156,7 +156,7 @@ class DistributedFusedAdam : public torch::optim::Adam {
     double _global_scale = std::numeric_limits<double>::quiet_NaN();
     bool _has_overflow = false;
 
-    at::Tensor _overflow_buf = at::zeros({1}, at::TensorOptions().dtype(at::kLong)
+    at::Tensor _overflow_buf = at::zeros({1}, at::TensorOptions().dtype(at::kInt)
       .device(at::kCUDA));
     at::Tensor _L2_grad_norm = at::zeros({1}, at::TensorOptions().dtype(at::kFloat)
       .device(at::kCUDA));

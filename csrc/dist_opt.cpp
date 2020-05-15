@@ -124,7 +124,7 @@ DistributedFusedAdam::DistributedFusedAdam(
          .num_blocks(_dwu_num_blocks)
          .num_rs_pg(_dwu_num_rs_pg)
          .num_ar_pg(_dwu_num_ar_pg)
-         .num_ag_pg(_dwu_num_ag_pg)
+         .num_ag_pg(_dwu_num_ag_pg ? _dwu_num_ag_pg : _dwu_num_rs_pg)
          .num_chunks(_dwu_num_chunks)
          .revert_method(_revert_method)
          .flat_mt(_flat_mt)
@@ -456,13 +456,13 @@ DistributedFusedAdam::DistributedFusedAdam(
 
     rs_pg.push_back(_rs_pg);
     rs_st.emplace_back(at::cuda::getStreamFromPool());
-    if (options.num_ag_pg() == 0) {
+    if (_dwu_num_ag_pg == 0) {
       ag_pg.push_back(_rs_pg);
       ag_st.emplace_back(at::cuda::getStreamFromPool());
     }
   }
   cudaDeviceSynchronize();
-  if (options.num_ag_pg() != 0) {
+  if (_dwu_num_ag_pg != 0) {
     for (int i=0; i<options.num_ag_pg(); i++) {
       std::snprintf(_pg_name, PG_NAME_LEN, "ag_pg_%ld_%d",
         options.group_rank(), i);
@@ -726,8 +726,10 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
     grads[1].push_back(individual_flat_grads[param_i]);
   } else {
     // FIXME: seems no C++ scalar division API
-    at::Tensor _coeff = torch::tensor({options.predivide() ?
-      options.world_size() : 1.0});
+    auto base_options = at::TensorOptions().device(at::kCUDA);
+    auto float_options = base_options.dtype(at::kFloat);
+    static at::Tensor _coeff = torch::tensor({options.predivide() ?
+      options.world_size() : 1.0}, float_options);
     at::div_out(param.grad(), _coeff, individual_flat_grads[param_i]);
   }
 
@@ -783,7 +785,7 @@ bool DistributedFusedAdam::_strided_check_finite(at::Tensor output_params,
   }
 
   strided_check_finite(_overflow_buf, out_p, stride, clear ? 1 : 0);
-  _has_overflow = (_overflow_buf.item<long>() != 0);
+  _has_overflow = (_overflow_buf.item<int>() != 0);
   return _has_overflow;
 }
 
