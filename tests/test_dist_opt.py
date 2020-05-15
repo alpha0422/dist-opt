@@ -5,8 +5,6 @@ import socket
 import torch
 import torch.multiprocessing as mp
 import unittest
-import apex
-import amp_C
 from distopt import DistributedFusedAdam
 
 class DistributedFusedAdamTest(unittest.TestCase):
