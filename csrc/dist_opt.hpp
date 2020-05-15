@@ -130,6 +130,12 @@ class DistributedFusedAdam : public torch::optim::Adam {
     // FIXME: this step() doesn't override the inherited one
     torch::Tensor step(LossClosure closure, bool skip_overflow_check);
 
+    /** FIXME: PyTorch doesn't have C++ scheduler, the solution now is to
+     *  use a proxy LR scheduler at Python side, then set/get the LR of
+     *  distributed optimizer every iteration.
+     */
+    float lr(float _lr);
+
   protected:
 #ifndef DIST_OPT_HOOK_TENSOR
     friend class AccGradPostHook;

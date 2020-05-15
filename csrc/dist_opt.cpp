@@ -911,6 +911,15 @@ torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr,
   return loss;
 }
 
+float DistributedFusedAdam::lr(float _lr=NAN) {
+  auto& group_options = static_cast<torch::optim::AdamOptions&>(
+    param_groups()[0].options());
+  if (std::isfinite(_lr)) {
+    group_options.lr(_lr);
+  }
+  return group_options.lr();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<DistributedFusedAdam>(m, "DistributedFusedAdam")
     .def(py::init<const std::vector<torch::Tensor> ,
@@ -953,6 +962,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("L2_grad_norm", &DistributedFusedAdam::L2_grad_norm)
     .def("complete_reductions", &DistributedFusedAdam::complete_reductions)
     .def("revert_step", &DistributedFusedAdam::revert_step)
+    .def("lr", &DistributedFusedAdam::lr, "lr"_a=NAN)
     .def("step", &DistributedFusedAdam::step, "closure"_a=nullptr,
       "skip_overflow_check"_a=false);
 }
