@@ -739,7 +739,7 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
     auto float_options = base_options.dtype(at::kFloat);
     static at::Tensor _coeff = torch::tensor({options.predivide() ?
       options.world_size() : 1.0}, float_options);
-    at::div_out(grad, _coeff, individual_flat_grads[param_i]);
+    at::div_out(individual_flat_grads[param_i], grad, _coeff);
   }
 
   grads_generated[param_i] = true;
