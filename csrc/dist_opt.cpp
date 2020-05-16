@@ -48,7 +48,8 @@ class AccGradPostHook : public torch::autograd::FunctionPostHook {
   variable_list operator()(
       const variable_list& outputs,
       const variable_list& /* unused */) override {
-    dfa->do_overlapped_reduction(p_i, p_grads_size, p_offset, param);
+    dfa->do_overlapped_reduction(p_i, p_grads_size, p_offset, param,
+      param.grad());
     return outputs;
   }
 
@@ -198,7 +199,7 @@ DistributedFusedAdam::DistributedFusedAdam(
 #ifdef DIST_OPT_HOOK_TENSOR
       // Hook on tensor
       auto hook = [&, p_i, p_grads_size, p_offset](at::Tensor grad) {
-        do_overlapped_reduction(p_i, p_grads_size, p_offset, p);
+        do_overlapped_reduction(p_i, p_grads_size, p_offset, p, grad);
       };
       p.register_hook(hook);
 #else 
@@ -708,8 +709,13 @@ void DistributedFusedAdam::flatten_grad_mt(float scale) {
   }
 }
 
+/** If hook on parameters, then param.grad() is unknown in the
+ *  C++ hook function here. The grad should passed from caller
+ *  in this case.
+ */
 void DistributedFusedAdam::do_overlapped_reduction(long param_i,
-    long param_grads_size, long param_offset, at::Tensor &param) {
+    long param_grads_size, long param_offset, at::Tensor &param,
+    at::Tensor &grad) {
   auto& param_state = static_cast<DistributedFusedAdamParamState&>(
       *state_[c10::guts::to_string(
       model_params[0].unsafeGetTensorImpl())]);
@@ -725,7 +731,7 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
       grads.push_back(std::vector<at::Tensor>());
     }
 
-    grads[0].push_back(param.grad());
+    grads[0].push_back(grad);
     grads[1].push_back(individual_flat_grads[param_i]);
   } else {
     // FIXME: seems no C++ scalar division API
@@ -733,7 +739,7 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
     auto float_options = base_options.dtype(at::kFloat);
     static at::Tensor _coeff = torch::tensor({options.predivide() ?
       options.world_size() : 1.0}, float_options);
-    at::div_out(param.grad(), _coeff, individual_flat_grads[param_i]);
+    at::div_out(grad, _coeff, individual_flat_grads[param_i]);
   }
 
   grads_generated[param_i] = true;

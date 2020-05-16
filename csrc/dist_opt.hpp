@@ -148,7 +148,7 @@ class DistributedFusedAdam : public torch::optim::Adam {
     void pipeline_step();
     void flatten_grad_mt(float scale);
     void do_overlapped_reduction(long param_i, long param_grads_size,
-      long param_offset, at::Tensor &param);
+      long param_offset, at::Tensor &param, at::Tensor &grad);
     bool _strided_check_finite(at::Tensor output_params, int stride,
       int start, int end, bool clear);
 
