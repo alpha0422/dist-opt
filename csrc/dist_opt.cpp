@@ -176,7 +176,10 @@ DistributedFusedAdam::DistributedFusedAdam(
     for (auto& p : group.params()) {
       // Broadcast parameter of rank 0
       std::vector<at::Tensor> tensors = {p};
-      std::shared_ptr<ProcessGroup::Work> work = default_pg.allreduce(tensors);
+      BroadcastOptions _opt;
+      _opt.rootRank = 0;
+      _opt.rootTensor = 0;
+      std::shared_ptr<ProcessGroup::Work> work = default_pg.broadcast(tensors, _opt);
       work->wait();
 
       if (!p.requires_grad())  continue;
