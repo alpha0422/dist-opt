@@ -375,7 +375,7 @@ DistributedFusedAdam::DistributedFusedAdam(
   for (int shard_id=0; shard_id<options.group_size(); shard_id++) {
     for (int block_id=0; block_id<options.num_blocks(); block_id++) {
       for (int chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
-        long flat_shard_start = ((block_id * options.num_blocks() + chunk_id)
+        long flat_shard_start = ((block_id * options.num_chunks() + chunk_id)
           * options.group_size() + shard_id) * options.shard_size();
         long flat_shard_end = flat_shard_start + options.shard_size();
         for (int p_idx=0; p_idx<p_i; p_idx++) {
