@@ -562,24 +562,24 @@ void DistributedFusedAdam::pipeline_block_reductions(long block_id) {
     auto current_stream = at::cuda::getCurrentCUDAStream();
     reduction_start[block_id][chunk_id].record(current_stream);
     reduction_start[block_id][chunk_id].block(rs_st[rs_idx]);
-    
-    at::cuda::CUDAStreamGuard guard(rs_st[rs_idx]);
-    std::vector<at::Tensor> outputTensors;
-    std::vector<std::vector<at::Tensor>> inputTensors;
-    outputTensors.emplace_back(fp16_g_chunks[block_id][chunk_id]);
-    inputTensors.emplace_back(flat_grads_shards[block_id][chunk_id]);
-    ReduceScatterOptions _opt;
-    _opt.noCopy = true;
+  
+    // Reduction within each node
+    {
+      at::cuda::CUDAStreamGuard guard(rs_st[rs_idx]);
+      std::vector<at::Tensor> outputTensors;
+      std::vector<std::vector<at::Tensor>> inputTensors;
+      outputTensors.emplace_back(fp16_g_chunks[block_id][chunk_id]);
+      inputTensors.emplace_back(flat_grads_shards[block_id][chunk_id]);
+      ReduceScatterOptions _opt;
+      _opt.noCopy = true;
 
-    std::shared_ptr<ProcessGroup::Work> _work = rs_pg[rs_idx]->reduce_scatter(
-      outputTensors, inputTensors, _opt);
-    reductions_works[block_id].push_back(_work);
-  }
+      std::shared_ptr<ProcessGroup::Work> _work = rs_pg[rs_idx]->reduce_scatter(
+        outputTensors, inputTensors, _opt);
+      reductions_works[block_id].push_back(_work);
+    }
 
-  // Reduction across nodes for each rank
-  if (options.num_groups() > 1) {
-    for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
-      long glob_chunk_id = block_id * options.num_chunks() + chunk_id;
+    // Reduction across nodes for each rank
+    if (options.num_groups() > 1) {
       long ar_idx = glob_chunk_id % (exposed ? options.exp_num_ar_pg() :
         options.num_ar_pg());
 
