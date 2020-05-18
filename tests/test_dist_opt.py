@@ -43,18 +43,22 @@ def _test_mp_dist_opt_simple(rank, world_size, port):
     _multi_process_setup(world_size, rank, port)
 
     model = torch.nn.LSTM(1024, 1024).cuda().half()
-    #model = torch.nn.Sequential(*(torch.nn.Linear(1024, 1024) for _ in range(12)))
-    #model = model.cuda().half()
     params = list(model.parameters())
     opt = DistributedFusedAdam(params, lr=1e-2, dwu_num_rs_pg=4, dwu_group_size=4)
+    scheduler = torch.optim.lr_scheduler.MultiplicativeLR(opt, lambda x: 1.1)
 
     x0 = torch.zeros((38, 16, 1024), device='cuda', dtype=torch.half)
-    #x0 = torch.zeros((16, 1024), device='cuda', dtype=torch.half)
     y0, _ = model(x0)
     dy = torch.zeros_like(y0)
     y0.backward(dy)
 
     opt.step()
+    scheduler.step()
+    opt.step()
+    scheduler.step()
+
+    assert abs(opt._dfa.lr() - 1e-2*1.1*1.1) / 1e-2*1.1*1.1 < 0.0001, \
+        "Expect LR: {}, get LR: {}".format(1e-2*1.1*1.1, opt._dfa.lr())
 
 class DistributedFusedAdamMultiProcessTest(unittest.TestCase):
     def setUp(self):
