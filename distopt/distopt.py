@@ -37,9 +37,6 @@ class DistributedFusedAdam(torch.optim.Adam):
 
         self.param_groups[0] = DictWatch(self.param_groups[0], hook)
 
-        # Forward document
-        self.__doc__ = self._dfa.__doc__
-
     def __getattr__(self, key):
         # Forward all other distributed optimizer method here
         # PyTorch LR scheduler require a weak reference to bound method

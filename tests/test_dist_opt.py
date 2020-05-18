@@ -57,8 +57,8 @@ def _test_mp_dist_opt_simple(rank, world_size, port):
     opt.step()
     scheduler.step()
 
-    assert abs(opt._dfa.lr() - 1e-2*1.1*1.1) / 1e-2*1.1*1.1 < 0.0001, \
-        "Expect LR: {}, get LR: {}".format(1e-2*1.1*1.1, opt._dfa.lr())
+    assert abs(opt.lr() - 1e-2*1.1*1.1) / 1e-2*1.1*1.1 < 0.0001, \
+        "Expect LR: {}, get LR: {}".format(1e-2*1.1*1.1, opt.lr())
 
 class DistributedFusedAdamMultiProcessTest(unittest.TestCase):
     def setUp(self):
