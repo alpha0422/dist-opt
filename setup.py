@@ -11,7 +11,7 @@ setup(
     packages=find_packages(),
     ext_modules=[
         CUDAExtension(
-            name='distopt',
+            name='_distopt',
             include_dirs=[os.path.dirname(os.path.realpath(__file__))],
             sources=['csrc/dist_opt.cpp'],
             extra_objects=[fused_adam_cuda.__file__, amp_C.__file__],
