@@ -5,12 +5,18 @@
 #include <THC/THC.h>
 
 #include <limits>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 #include "../c10d/ProcessGroupNCCL.hpp"
 #include "../c10d/TCPStore.hpp"
 #include "../c10d/PrefixStore.hpp"
 
+#include "../readerwriterqueue/readerwriterqueue.h"
+
 using namespace c10d;
+using namespace moodycamel;
 
 // Hook on AccumulateGrad by default
 #undef DIST_OPT_HOOK_TENSOR
@@ -120,7 +126,7 @@ class DistributedFusedAdam : public torch::optim::Adam {
           bool _predivide,
           bool _e5m2_allgather,
           bool _do_not_flatten_model);
-    ~DistributedFusedAdam() {}
+    ~DistributedFusedAdam();
     void set_last_step(bool last_step);
     void set_global_scale(double global_scale);
     double global_scale();
@@ -153,6 +159,12 @@ class DistributedFusedAdam : public torch::optim::Adam {
       long param_offset, at::Tensor &param, at::Tensor &grad);
     bool _strided_check_finite(at::Tensor output_params, int stride,
       int start, int end, bool clear);
+
+    std::thread::id master_tid;  // producer tid
+    std::atomic<bool> _isRunning;
+    std::unique_ptr<std::thread> _worker;
+    BlockingReaderWriterQueue<std::function<void()> > _queue;
+    void _worker_thread();
 
   private:
     DistributedOptimizerOptions options;

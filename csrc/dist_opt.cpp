@@ -108,6 +108,7 @@ DistributedFusedAdam::DistributedFusedAdam(
         torch::optim::AdamOptions(_lr)
           .betas(_betas).weight_decay(_weight_decay)
           .eps(_eps).amsgrad(_amsgrad)),
+      master_tid(std::this_thread::get_id()),
       _current_block(_overlap_reductions ? _dwu_num_blocks : -1),
       l2_grad_norm_st(at::cuda::getStreamFromPool()),
       completion_st(at::cuda::getStreamFromPool()),
@@ -515,7 +516,18 @@ DistributedFusedAdam::DistributedFusedAdam(
     reduction_finish.push_back(at::cuda::CUDAEvent());
   }
 
+  // Create and start worker thread
+  _worker = std::make_unique<std::thread>(&DistributedFusedAdam::_worker_thread,
+    &*this);
+
   LOGGING("DistributedFusedAdam init done.\n");
+}
+
+DistributedFusedAdam::~DistributedFusedAdam() {
+  _isRunning = false;
+  if (_worker->joinable()) {
+	_worker->join();
+  }
 }
 
 void DistributedFusedAdam::set_last_step(bool last_step) {
@@ -934,6 +946,18 @@ float DistributedFusedAdam::lr(float _lr=NAN) {
     group_options.lr(_lr);
   }
   return group_options.lr();
+}
+
+void DistributedFusedAdam::_worker_thread() {
+  std::function<void()> func;
+  _isRunning = true;
+
+  do {
+    bool success = _queue.wait_dequeue_timed(func,
+      std::chrono::milliseconds(200));
+    if (!success)  continue;
+    func();
+  } while(_isRunning);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
