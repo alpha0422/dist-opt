@@ -526,14 +526,17 @@ std::pair<long, long> DistributedFusedAdam::get_flush_block() {
   // Use -1 to denote empty flush block
   auto flush_block = std::make_pair<long, long>(-1 ,-1);
 
+  if (_current_block == options.num_blocks()) {
+    _contiguous_idx = grads_generated.size();
+  }
+
   if (_current_block > 0 && grads_generated[low_param_i[_current_block-1]]) {
     long num_grads = grads_generated.size();
-    long contiguous_idx = num_grads;
-    while (contiguous_idx > 0 && grads_generated[contiguous_idx-1]) {
-      contiguous_idx--;
+    while (_contiguous_idx > 0 && grads_generated[_contiguous_idx-1]) {
+      _contiguous_idx--;
     }
 
-    if (contiguous_idx < num_grads && grads_info[contiguous_idx].second <=
+    if (_contiguous_idx < num_grads && grads_info[_contiguous_idx].second <=
         (_current_block - 1) * options.block_size()) {
       _current_block--;
       long start = _current_block * options.block_size();

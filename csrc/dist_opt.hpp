@@ -159,6 +159,7 @@ class DistributedFusedAdam : public torch::optim::Adam {
 
     // Distributed optimizer specifics
     int _current_block;
+    int _contiguous_idx;
     bool _last_step = false;
     // Must set global scale first
     double _global_scale = std::numeric_limits<double>::quiet_NaN();
