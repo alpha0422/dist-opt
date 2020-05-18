@@ -91,14 +91,15 @@ DistributedFusedAdam::DistributedFusedAdam(
       bool _overlap_reductions = true,
       bool _full_pipeline = true,
       bool _compute_L2_grad_norm = false,
-      long _distributed_weight_update = 0,
       long _dwu_group_size = 0,
       long _dwu_num_blocks = 4,
+      long _dwu_num_chunks = 4,
       long _dwu_num_rs_pg = 1,
       long _dwu_num_ar_pg = 4,
       long _dwu_num_ag_pg = 0,
-      long _dwu_num_chunks = 4,
-      long _revert_method = 1,
+      bool _dwu_exp_enabled = false,
+      long _dwu_exp_num_rs_pg = 1,
+      long _dwu_exp_num_ar_pg = 4,
       bool _flat_mt = false,
       bool _predivide = true,
       bool _e5m2_allgather = false,
@@ -121,13 +122,14 @@ DistributedFusedAdam::DistributedFusedAdam(
          .overlap_reductions(_overlap_reductions)
          .full_pipeline(_full_pipeline)
          .compute_L2_grad_norm(_compute_L2_grad_norm)
-         .distributed_weight_update(_distributed_weight_update)
          .num_blocks(_dwu_num_blocks)
+         .num_chunks(_dwu_num_chunks)
          .num_rs_pg(_dwu_num_rs_pg)
          .num_ar_pg(_dwu_num_ar_pg)
          .num_ag_pg(_dwu_num_ag_pg ? _dwu_num_ag_pg : _dwu_num_rs_pg)
-         .num_chunks(_dwu_num_chunks)
-         .revert_method(_revert_method)
+         .exp_enabled(_dwu_exp_enabled)
+         .exp_num_rs_pg(_dwu_exp_num_rs_pg)
+         .exp_num_ar_pg(_dwu_exp_num_ar_pg)
          .flat_mt(_flat_mt)
          .predivide(_predivide)
          .e5m2_allgather(_e5m2_allgather)
@@ -151,11 +153,6 @@ DistributedFusedAdam::DistributedFusedAdam(
       !defaults.amsgrad()));
   assert(("More than one parameter group is not supported.",
       param_groups().size() == 1));
-
-  if (options.revert_method() > 1) {
-    std::cout << "revert_method -> double buffer fp32 parameters, "
-        "will consume more memory" << std::endl;
-  }
 
   LOGGING("master: %s:%d\n", options.master_addr().c_str(), options.master_port());
   LOGGING("group_size %ld num_groups %ld rank_in_group %ld\n",
@@ -421,7 +418,9 @@ DistributedFusedAdam::DistributedFusedAdam(
   char _pg_name[PG_NAME_LEN];
   std::vector<at::Tensor> _tensors = {at::zeros({1}, float_options)};
   if (options.num_groups() > 1) {
-    for (int i=0; i<options.num_ar_pg(); i++) {
+    long _num_ar_pg = options.exp_enabled() ? std::max(options.num_ar_pg(),
+      options.exp_num_ar_pg()) : options.num_ar_pg();
+    for (int i=0; i<_num_ar_pg; i++) {
       std::snprintf(_pg_name, PG_NAME_LEN, "ar_pg_%ld_%d",
         options.rank_in_group(), i);
       auto prefix_store = std::make_shared<PrefixStore>(_pg_name, store);
@@ -445,7 +444,9 @@ DistributedFusedAdam::DistributedFusedAdam(
   }
 
   // Re-use reduce-scatter process group for all-gather if num_ag_pg is 0
-  for (int i=0; i<options.num_rs_pg(); i++) {
+  long _num_rs_pg = options.exp_enabled() ? std::max(options.num_rs_pg(),
+    options.exp_num_rs_pg()) : options.num_rs_pg();
+  for (int i=0; i<_num_rs_pg; i++) {
     std::snprintf(_pg_name, PG_NAME_LEN, "rs_pg_%ld_%d",
       options.group_rank(), i);
     auto prefix_store = std::make_shared<PrefixStore>(_pg_name, store);
@@ -545,6 +546,8 @@ std::pair<long, long> DistributedFusedAdam::get_flush_block() {
 }
 
 void DistributedFusedAdam::pipeline_block_reductions(long block_id) {
+  bool exposed = options.exp_enabled() && (!options.overlap_reductions() ||
+    block_id == 0);
   flatten_grad_mt(options.predivide() ? (1.0 / options.world_size()) : 1.0);
 
   /** Reduction within each node
@@ -554,13 +557,13 @@ void DistributedFusedAdam::pipeline_block_reductions(long block_id) {
   reductions_works[block_id].clear();
   for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
     long glob_chunk_id = block_id * options.num_chunks() + chunk_id;
-    auto rs_stream = rs_st[glob_chunk_id % options.num_rs_pg()];
+    long rs_idx = glob_chunk_id % (exposed ? options.exp_num_rs_pg() :
+      options.num_rs_pg());
     auto current_stream = at::cuda::getCurrentCUDAStream();
     reduction_start[block_id][chunk_id].record(current_stream);
-    reduction_start[block_id][chunk_id].block(rs_stream);
+    reduction_start[block_id][chunk_id].block(rs_st[rs_idx]);
     
-    at::cuda::CUDAStreamGuard guard(rs_stream);
-    auto _rs_pg = rs_pg[glob_chunk_id % options.num_rs_pg()];
+    at::cuda::CUDAStreamGuard guard(rs_st[rs_idx]);
     std::vector<at::Tensor> outputTensors;
     std::vector<std::vector<at::Tensor>> inputTensors;
     outputTensors.emplace_back(fp16_g_chunks[block_id][chunk_id]);
@@ -568,7 +571,7 @@ void DistributedFusedAdam::pipeline_block_reductions(long block_id) {
     ReduceScatterOptions _opt;
     _opt.noCopy = true;
 
-    std::shared_ptr<ProcessGroup::Work> _work = _rs_pg->reduce_scatter(
+    std::shared_ptr<ProcessGroup::Work> _work = rs_pg[rs_idx]->reduce_scatter(
       outputTensors, inputTensors, _opt);
     reductions_works[block_id].push_back(_work);
   }
@@ -577,14 +580,15 @@ void DistributedFusedAdam::pipeline_block_reductions(long block_id) {
   if (options.num_groups() > 1) {
     for (long chunk_id=0; chunk_id<options.num_chunks(); chunk_id++) {
       long glob_chunk_id = block_id * options.num_chunks() + chunk_id;
-      auto ar_stream = ar_st[glob_chunk_id % options.num_ar_pg()];
+      long ar_idx = glob_chunk_id % (exposed ? options.exp_num_ar_pg() :
+        options.num_ar_pg());
 
-      at::cuda::CUDAStreamGuard guard(ar_stream);
+      at::cuda::CUDAStreamGuard guard(ar_st[ar_idx]);
       reductions_works[block_id][chunk_id]->wait();
-      auto _ar_pg = ar_pg[glob_chunk_id % options.num_ar_pg()];
       std::vector<at::Tensor> tensors;
       tensors.emplace_back(fp16_g_chunks[block_id][chunk_id]);
-      std::shared_ptr<ProcessGroup::Work> _work = _ar_pg->allreduce(tensors);
+      std::shared_ptr<ProcessGroup::Work> _work =
+        ar_pg[ar_idx]->allreduce(tensors);
       reductions_works[block_id][chunk_id] = _work;
     }
   }
@@ -934,8 +938,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def(py::init<const std::vector<torch::Tensor> ,
       double, std::tuple<double, double>, double, double, bool, // amsgrad
       bool, bool, double, bool, double, bool, // overlap_reductions
-      bool, bool, long, long, long, long, long, long, long,
-      long, bool, bool, bool, bool>(),
+      bool, bool, long, long, long, long, long, long, // dwu_num_ag_pg
+      bool, long, long, bool, bool, bool, bool>(),
       "params"_a,
       "lr"_a=1e-3,
       "betas"_a = std::make_tuple(0.9, 0.999),
@@ -950,14 +954,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "overlap_reductions"_a=true,
       "full_pipeline"_a=true,
       "compute_L2_grad_norm"_a=false,
-      "distributed_weight_update"_a=0,
       "dwu_group_size"_a=0,
       "dwu_num_blocks"_a=4,
+      "dwu_num_chunks"_a=4,
       "dwu_num_rs_pg"_a=1,
       "dwu_num_ar_pg"_a=4,
       "dwu_num_ag_pg"_a=0,
-      "dwu_num_chunks"_a=4,
-      "revert_method"_a=1,
+      "dwu_exp_enabled"_a=false,
+      "dwu_exp_num_rs_pg"_a=1,
+      "dwu_exp_num_ar_pg"_a=4,
       "flat_mt"_a=false,
       "predivide"_a=true,
       "e5m2_allgather"_a=false,

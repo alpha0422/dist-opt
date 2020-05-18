@@ -27,13 +27,14 @@ struct DistributedOptimizerOptions {
   TORCH_ARG(bool, overlap_reductions) = true;
   TORCH_ARG(bool, full_pipeline) = true;
   TORCH_ARG(bool, compute_L2_grad_norm) = false;
-  TORCH_ARG(long, distributed_weight_update) = 0;
   TORCH_ARG(long, num_blocks) = 4;
+  TORCH_ARG(long, num_chunks) = 4;
   TORCH_ARG(long, num_rs_pg) = 1;
   TORCH_ARG(long, num_ar_pg) = 4;
   TORCH_ARG(long, num_ag_pg) = 0;
-  TORCH_ARG(long, num_chunks) = 4;
-  TORCH_ARG(long, revert_method) = 1;
+  TORCH_ARG(bool, exp_enabled) = false;
+  TORCH_ARG(long, exp_num_rs_pg) = 1;
+  TORCH_ARG(long, exp_num_ar_pg) = 4;
   TORCH_ARG(bool, flat_mt) = false;
   TORCH_ARG(bool, predivide) = true;
   TORCH_ARG(bool, e5m2_allgather) = false;
@@ -106,14 +107,15 @@ class DistributedFusedAdam : public torch::optim::Adam {
           bool _overlap_reductions,
           bool _full_pipeline,
           bool _compute_L2_grad_norm,
-          long _distributed_weight_update,
           long _dwu_group_size,
           long _dwu_num_blocks,
+          long _dwu_num_chunks,
           long _dwu_num_rs_pg,
           long _dwu_num_ar_pg,
           long _dwu_num_ag_pg,
-          long _dwu_num_chunks,
-          long _revert_method,
+          bool _dwu_exp_enabled,
+          long _dwu_exp_num_rs_pg,
+          long _dwu_exp_num_ar_pg,
           bool _flat_mt,
           bool _predivide,
           bool _e5m2_allgather,
