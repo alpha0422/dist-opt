@@ -54,6 +54,7 @@ struct DistributedOptimizerOptions {
   TORCH_ARG(int, rank);
   TORCH_ARG(std::string, master_addr);
   TORCH_ARG(int, master_port);
+  TORCH_ARG(int, device);
   TORCH_ARG(long, group_size) = 0;
   TORCH_ARG(long, num_groups);
   TORCH_ARG(long, group_rank);
@@ -134,7 +135,6 @@ class DistributedFusedAdam : public torch::optim::Adam {
     bool peek_overflow();
     float L2_grad_norm();
     void complete_reductions();
-    void revert_step();
     // FIXME: this step() doesn't override the inherited one
     torch::Tensor step(LossClosure closure, bool skip_overflow_check);
 
@@ -159,9 +159,12 @@ class DistributedFusedAdam : public torch::optim::Adam {
       long param_offset, at::Tensor &param, at::Tensor &grad);
     bool _strided_check_finite(at::Tensor output_params, int stride,
       int start, int end, bool clear);
+    void revert_step();
 
-    std::thread::id master_tid;  // producer tid
-    std::atomic<bool> _isRunning;
+    std::thread::id worker_tid;
+    std::atomic<bool> _isRunning;  // for worker thread join
+    std::mutex _mutex;
+    std::condition_variable _cv;
     std::unique_ptr<std::thread> _worker;
     BlockingReaderWriterQueue<std::function<void()> > _queue;
     void _worker_thread();
@@ -181,6 +184,8 @@ class DistributedFusedAdam : public torch::optim::Adam {
       .device(at::kCUDA));
     at::Tensor _L2_grad_norm = at::zeros({1}, at::TensorOptions().dtype(at::kFloat)
       .device(at::kCUDA));
+    float _L2_grad_norm_cpu;
+    bool _L2_grad_norm_ready = false;
 
     // Pair of (param_grads_size, param_offset)
     std::vector<std::pair<int64_t, int64_t> > grads_info;

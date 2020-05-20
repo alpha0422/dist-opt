@@ -2,6 +2,8 @@
 #include "fused_adam_cuda.hpp"
 
 #include <cmath>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 using torch::indexing::Slice;
 
@@ -15,17 +17,20 @@ using namespace pybind11::literals;
 #define NCCL_TIME_OUT (120 * 1000)
 #define MT_CHUNK_SIZE (2048 * 32) // apex/apex/multi_tensor_apply/__init__.py
 
+#define gettid() syscall(SYS_gettid)
+
 #define LOGGING(fmt, ...) do { \
   if (options.logging()) { \
-    std::printf("[%d:%d] " fmt, options.world_size(), options.rank(), \
-      ##__VA_ARGS__); \
+    std::printf("[%d:%d][%6ld] " fmt, options.world_size(), options.rank(), \
+      static_cast<long>(gettid()), ##__VA_ARGS__); \
     std::cout.flush(); \
   } \
 } while(0)
 
 #define LOGGING_VEC(prefix, fmt, vec) do { \
   if (options.logging()) { \
-    std::printf("[%d:%d] " prefix, options.world_size(), options.rank()); \
+    std::printf("[%d:%d][%6ld] " prefix, options.world_size(), options.rank(), \
+      static_cast<long>(gettid())); \
     for (auto i : vec) { \
       std::printf(" " fmt, i); \
     } \
@@ -108,7 +113,6 @@ DistributedFusedAdam::DistributedFusedAdam(
         torch::optim::AdamOptions(_lr)
           .betas(_betas).weight_decay(_weight_decay)
           .eps(_eps).amsgrad(_amsgrad)),
-      master_tid(std::this_thread::get_id()),
       _current_block(_overlap_reductions ? _dwu_num_blocks : -1),
       l2_grad_norm_st(at::cuda::getStreamFromPool()),
       completion_st(at::cuda::getStreamFromPool()),
@@ -142,7 +146,8 @@ DistributedFusedAdam::DistributedFusedAdam(
          .master_addr(getenv("MASTER_ADDR"))
          .master_port(atoi(getenv("MASTER_PORT")));
 
-  options.group_size(_dwu_group_size <= 0 ? torch::cuda::device_count() :
+  options.device(at::cuda::current_device())
+         .group_size(_dwu_group_size <= 0 ? torch::cuda::device_count() :
             _dwu_group_size)
          .num_groups(options.world_size() / options.group_size())
          .group_rank(options.rank() / options.group_size())
@@ -518,7 +523,8 @@ DistributedFusedAdam::DistributedFusedAdam(
 
   // Create and start worker thread
   _worker = std::make_unique<std::thread>(&DistributedFusedAdam::_worker_thread,
-    &*this);
+    this);
+  worker_tid = _worker->get_id();
 
   LOGGING("DistributedFusedAdam init done.\n");
 }
@@ -531,6 +537,11 @@ DistributedFusedAdam::~DistributedFusedAdam() {
 }
 
 void DistributedFusedAdam::set_last_step(bool last_step) {
+  if (std::this_thread::get_id() != worker_tid) {
+    _queue.enqueue([=] { set_last_step(last_step); });
+    return;
+  }
+
   _last_step = last_step;
 }
 
@@ -735,6 +746,20 @@ void DistributedFusedAdam::flatten_grad_mt(float scale) {
 void DistributedFusedAdam::do_overlapped_reduction(long param_i,
     long param_grads_size, long param_offset, at::Tensor &param,
     at::Tensor &grad) {
+  if (std::this_thread::get_id() != worker_tid) {
+    // Clear L2 grad norm for previous iteration here as it may
+    // used after the step() function.
+    if (_L2_grad_norm_ready) {
+      _L2_grad_norm_ready = false;
+    }
+
+    _queue.enqueue([=, &param, &grad] {
+      do_overlapped_reduction(param_i, param_grads_size, param_offset,
+        param, grad);
+    });
+    return;
+  }
+
   auto& param_state = static_cast<DistributedFusedAdamParamState&>(
       *state_[c10::guts::to_string(
       model_params[0].unsafeGetTensorImpl())]);
@@ -777,10 +802,21 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
 
 /** Set global scale. */
 void DistributedFusedAdam::set_global_scale(double global_scale) {
+  if (std::this_thread::get_id() != worker_tid) {
+    _queue.enqueue([=] { set_global_scale(global_scale); });
+    return;
+  }
+
   _global_scale = global_scale; 
 }
 
 double DistributedFusedAdam::global_scale() {
+  // Wait all pending operations to finish
+  if (std::this_thread::get_id() != worker_tid) {
+    std::unique_lock<std::mutex> _lock(_mutex);
+    _cv.wait(_lock, [this]{return _queue.size_approx() == 0;});
+  }
+
   return _global_scale;
 }
 
@@ -788,6 +824,12 @@ double DistributedFusedAdam::global_scale() {
  *  Clears the overflow flag.
  */
 bool DistributedFusedAdam::has_overflow() {
+  // Wait all pending operations to finish
+  if (std::this_thread::get_id() != worker_tid) {
+    std::unique_lock<std::mutex> _lock(_mutex);
+    _cv.wait(_lock, [this]{return _queue.size_approx() == 0;});
+  }
+
   bool has_overflow = _has_overflow;
   _has_overflow = false;
   return has_overflow;
@@ -797,6 +839,12 @@ bool DistributedFusedAdam::has_overflow() {
  *  Does not clear overflow flag.
  */
 bool DistributedFusedAdam::peek_overflow() {
+  // Wait all pending operations to finish
+  if (std::this_thread::get_id() != worker_tid) {
+    std::unique_lock<std::mutex> _lock(_mutex);
+    _cv.wait(_lock, [this]{return _queue.size_approx() == 0;});
+  }
+
   return _has_overflow;
 }
 
@@ -818,19 +866,37 @@ bool DistributedFusedAdam::_strided_check_finite(at::Tensor output_params,
 }
 
 float DistributedFusedAdam::L2_grad_norm() {
-  if (options.compute_L2_grad_norm()) {
-    auto current_stream = at::cuda::getCurrentCUDAStream();
-    l2_grad_norm_event.record(l2_grad_norm_st);
-    l2_grad_norm_event.block(current_stream);
-    return _L2_grad_norm.item<float>();
+  if (!options.compute_L2_grad_norm()) {
+    return NAN;
   }
-  return NAN;
+
+  if (_L2_grad_norm_ready) {
+    return _L2_grad_norm_cpu;
+  }
+
+  // Wait all pending operations to finish for master.
+  if (std::this_thread::get_id() != worker_tid) {
+    std::unique_lock<std::mutex> _lock(_mutex);
+    _cv.wait(_lock, [this]{return _queue.size_approx() == 0;});
+  }
+
+  auto current_stream = at::cuda::getCurrentCUDAStream();
+  l2_grad_norm_event.record(l2_grad_norm_st);
+  l2_grad_norm_event.block(current_stream);
+  _L2_grad_norm_cpu = _L2_grad_norm.item<float>();
+  _L2_grad_norm_ready = true;
+  return _L2_grad_norm_cpu;
 }
 
 /** Complete reductions if full pipeline is not selected or overlap
  *  is not allowed.
  */
 void DistributedFusedAdam::complete_reductions() {
+  if (std::this_thread::get_id() != worker_tid) {
+    _queue.enqueue([=] { complete_reductions(); });
+    return;
+  }
+
   if (_last_step) {
     // zero out gradients that have not been completed yet
     for (size_t param_i=0; param_i<grads_generated.size(); param_i++) {
@@ -895,6 +961,19 @@ void DistributedFusedAdam::revert_step() {
 
 torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr,
     bool skip_overflow_check=false) {
+  // Relase GIL as we may take long time to wait
+  py::gil_scoped_release release;
+
+  /** Wait all pending operations to finish.
+   *  We just need to make sure worker thread is idle, no need to hold
+   *  the unique lock through the whole step() function as we may encounter
+   *  reentrant issue.
+   */
+  {
+    std::unique_lock<std::mutex> _lock(_mutex);
+    _cv.wait(_lock, [this]{return _queue.size_approx() == 0;});
+  }
+
   at::Tensor loss;
   if (closure != nullptr) {
     loss = closure();
@@ -940,6 +1019,12 @@ torch::Tensor DistributedFusedAdam::step(LossClosure closure = nullptr,
 }
 
 float DistributedFusedAdam::lr(float _lr=NAN) {
+  if (_lr != NAN) {
+    assert(("LR is only safe to change when there's no pending "
+      "operations. Please move LR scheduler step() call to safe regions.",
+      _queue.size_approx() == 0));
+  }
+
   auto& group_options = static_cast<torch::optim::AdamOptions&>(
     param_groups()[0].options());
   if (std::isfinite(_lr)) {
@@ -949,14 +1034,26 @@ float DistributedFusedAdam::lr(float _lr=NAN) {
 }
 
 void DistributedFusedAdam::_worker_thread() {
+  /** New thread defaults to device 0.
+   *  WARN: we need to be careful on *current stream* for asynchronous
+   *  distributed optimizer, in case the master and worker have different
+   *  streams get from API *current stream*. Currently seems fine.
+   */
+  at::cuda::set_device(options.device());
+  LOGGING("Worker using device %d stream %d\n", at::cuda::current_device(),
+    at::cuda::getCurrentCUDAStream().id());
+
   std::function<void()> func;
   _isRunning = true;
 
   do {
     bool success = _queue.wait_dequeue_timed(func,
-      std::chrono::milliseconds(200));
-    if (!success)  continue;
-    func();
+      std::chrono::microseconds(100));
+    if (success) {
+      std::unique_lock<std::mutex> _lock(_mutex);
+      func();
+    }
+    _cv.notify_one();
   } while(_isRunning);
 }
 
@@ -1002,7 +1099,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def_property_readonly("peek_overflow", &DistributedFusedAdam::peek_overflow)
     .def_property_readonly("L2_grad_norm", &DistributedFusedAdam::L2_grad_norm)
     .def("complete_reductions", &DistributedFusedAdam::complete_reductions)
-    .def("revert_step", &DistributedFusedAdam::revert_step)
     .def("lr", &DistributedFusedAdam::lr, "lr"_a=NAN)
     .def("step", &DistributedFusedAdam::step, "closure"_a=nullptr,
       "skip_overflow_check"_a=false);
