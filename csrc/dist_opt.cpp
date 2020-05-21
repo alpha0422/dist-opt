@@ -745,7 +745,7 @@ void DistributedFusedAdam::flatten_grad_mt(float scale) {
  */
 void DistributedFusedAdam::do_overlapped_reduction(long param_i,
     long param_grads_size, long param_offset, at::Tensor &param,
-    at::Tensor &grad) {
+    const at::Tensor &grad) {
   if (std::this_thread::get_id() != worker_tid) {
     // Clear L2 grad norm for previous iteration here as it may
     // used after the step() function.
@@ -753,7 +753,8 @@ void DistributedFusedAdam::do_overlapped_reduction(long param_i,
       _L2_grad_norm_ready = false;
     }
 
-    _queue.enqueue([=, &param, &grad] {
+    // Grad tensor might change in future, can't capture by reference here
+    _queue.enqueue([=, &param] {
       do_overlapped_reduction(param_i, param_grads_size, param_offset,
         param, grad);
     });
